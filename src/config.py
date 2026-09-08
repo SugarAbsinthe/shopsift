@@ -46,7 +46,7 @@ class Config:
     # LangSmith
     LANGSMITH_TRACING: bool = os.getenv("LANGSMITH_TRACING", "false").lower() == "true"
     LANGSMITH_API_KEY: str = os.getenv("LANGSMITH_API_KEY", "")
-    LANGSMITH_PROJECT: str = os.getenv("LANGSMITH_PROJECT", "langgraph-shop-agent")
+    LANGSMITH_PROJECT: str = os.getenv("LANGSMITH_PROJECT", "shopsift")
     LANGSMITH_ENDPOINT: str = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
 
 

@@ -20,8 +20,8 @@ from backend.logging_config import get_request_id, reset_request_id, set_request
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 app = FastAPI(
-    title="ShopAgent API",
-    description="Backend API for the intelligent shopping guide Agent",
+    title="ShopSift API",
+    description="Backend API for the ShopSift intelligent shopping assistant",
     version="1.0.0",
 )
 
@@ -58,7 +58,7 @@ app.include_router(health.router, prefix="/api")
 @app.on_event("startup")
 async def startup():
     """Log startup — agent is lazily initialized on first request."""
-    logging.info("ShopAgent API server started.")
+    logging.info("ShopSift API server started.")
 
 
 @app.on_event("shutdown")

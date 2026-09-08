@@ -1,7 +1,7 @@
 [project]
-name = "shopping-guide-agent"
+name = "shopsift"
 version = "0.1.0"
-description = "Dynamic Profile-Aware Shopping Guide Agent — laptop recommendations with LangGraph"
+description = "ShopSift: a profile-aware shopping guide for laptop recommendations with LangGraph"
 requires-python = ">=3.9"
 dependencies = [
     "langchain>=0.3.0",

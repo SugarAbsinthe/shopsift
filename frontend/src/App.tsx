@@ -34,8 +34,8 @@ export default function App() {
             <Sparkles size={16} className="text-white" />
           </div>
           <div>
-            <h1 className="text-sm font-semibold text-slate-800 leading-tight">智能导购助手</h1>
-            <p className="text-[11px] text-slate-400 leading-tight">AI 购物顾问 · 随时在线</p>
+            <h1 className="text-sm font-semibold text-slate-800 leading-tight">ShopSift</h1>
+            <p className="text-[11px] text-slate-400 leading-tight">智能购物助手 · 随时在线</p>
           </div>
         </div>
         <div className="flex-1" />

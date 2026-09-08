@@ -34,7 +34,7 @@ _MAX_LOG_TEXT = 500
 _stream_handler = logging.StreamHandler()
 _stream_handler.setFormatter(logging.Formatter("%(message)s"))
 
-logger = logging.getLogger("shopagent")
+logger = logging.getLogger("shopsift")
 logger.setLevel(logging.INFO)
 logger.handlers = [_stream_handler]
 logger.propagate = False

@@ -76,7 +76,7 @@ CONV_STORE = ConversationStore(str(BASE_DIR / "data" / "conversations.db"))
 
 
 # ---- Page config ----
-st.set_page_config(page_title="智能导购 Agent", page_icon="🛒", layout="wide")
+st.set_page_config(page_title="ShopSift · 智能购物助手", page_icon="🛒", layout="wide")
 
 
 # ---- Session State ----
@@ -229,8 +229,8 @@ def render_profile_panel(profile_str: str):
 # ============================================================
 
 with st.sidebar:
-    st.title("🛒 智能导购")
-    st.caption("AI 购物助手")
+    st.title("🛒 ShopSift")
+    st.caption("智能购物助手")
 
     # --- New Chat ---
     if st.button("＋ 新对话", use_container_width=True):
@@ -334,7 +334,7 @@ with st.sidebar:
 # Main Chat Area
 # ============================================================
 
-st.title("🛒 智能导购助手")
+st.title("🛒 ShopSift 智能购物助手")
 st.caption("告诉我你的需求和预算，我帮你找到最合适的产品。目前产品库以 3C 数码（笔记本）为主，更多品类持续扩展中。")
 
 # Create initial conversation if needed

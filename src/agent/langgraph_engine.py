@@ -371,7 +371,7 @@ class ShoppingGuideGraph:
         conv_hash = hash_identifier(conv_id)
         return {
             "configurable": {"thread_id": conv_id},
-            "tags": ["shopping-agent"],
+            "tags": ["shopsift"],
             "metadata": {
                 "run_id": telemetry.run_id,
                 "request_id": telemetry.request_id,

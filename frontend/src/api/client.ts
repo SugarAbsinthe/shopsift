@@ -1,4 +1,4 @@
-/* ---- Thin fetch wrapper for ShopAgent API ---- */
+/* ---- Thin fetch wrapper for ShopSift API ---- */
 
 const BASE = "/api";
 const DEFAULT_TIMEOUT = 90_000; // 90s — agent init + LLM call can be slow

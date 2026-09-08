@@ -1,6 +1,6 @@
-# langgraph-shop-agent
+# ShopSift
 
-基于 LangGraph 的智能导购 Agent。用户用自然语言描述需求，Agent 自动挖掘偏好、检索产品、对比推荐，并在同一会话中持久化图状态与用户画像。
+ShopSift 是基于 LangGraph 的智能购物助手。用户用自然语言描述需求，ShopSift 自动挖掘偏好、检索产品、对比推荐，并在同一会话中持久化图状态与用户画像。
 
 ```
  React 前端 ──真实 Token SSE──→ FastAPI ──→ Agent (单例)
