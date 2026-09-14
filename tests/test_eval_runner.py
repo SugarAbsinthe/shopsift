@@ -38,6 +38,29 @@ def test_case_failure_contains_objective_reasons():
     assert not result.passed
     assert any("stage=" in failure for failure in result.failures)
     assert any("retrieval_triggered=" in failure for failure in result.failures)
+    assert "STAGE_MISMATCH" in result.failure_codes
+    assert "RETRIEVAL_TRIGGER_MISMATCH" in result.failure_codes
+
+
+def test_case_execution_error_isolated_as_a_failure(monkeypatch):
+    import evals.runner as runner
+
+    class BrokenGraph:
+        def __init__(self, **kwargs):
+            raise RuntimeError("secret fixture detail")
+
+    monkeypatch.setattr(runner, "ShoppingGuideGraph", BrokenGraph)
+    case = EvalCase.model_validate({
+        "id": "isolated_error",
+        "question": "你好",
+        "expected_stages": ["discovery"],
+        "expected_retrieval": False,
+    })
+    result = run_deterministic_case(case)
+    assert result.passed is False
+    assert result.failure_codes == ["EXECUTION_ERROR"]
+    assert result.failures == ["execution error: RuntimeError"]
+    assert "secret" not in str(result.failures)
 
 
 def test_tool_error_and_loop_limit_cases_pass():
@@ -61,8 +84,21 @@ def test_report_writer_outputs_json_and_markdown(tmp_path):
     json_path, markdown_path = write_reports(summary, results, tmp_path)
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["mode"] == "deterministic"
+    assert payload["report_schema_version"] == 1
     assert payload["summary"]["total"] == 2
+    assert payload["summary"]["failure_counts"] == {}
     assert "Pass rate" in markdown_path.read_text(encoding="utf-8")
+
+
+def test_default_cli_writes_manifest_and_gate_metadata(tmp_path):
+    exit_code = main([
+        "--output-dir", str(tmp_path),
+    ])
+    assert exit_code == 0
+    payload = json.loads((tmp_path / "deterministic.json").read_text(encoding="utf-8"))
+    assert payload["metadata"]["dataset"]["dataset_id"] == "agent-behavior-v1"
+    assert payload["gate"]["name"] == "agent-deterministic-regression"
+    assert payload["gate"]["passed"] is True
 
 
 def test_cli_returns_nonzero_for_failed_suite(tmp_path):

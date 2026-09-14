@@ -31,7 +31,7 @@ cd frontend && npm install && npm run dev
 ## 项目结构
 
 ```
-src/agent/       LangGraph 编排、确定性商品召回、per-stage Prompt、5 工具
+src/agent/       LangGraph 编排、确定性商品召回、per-stage Prompt、主图 5 工具
 src/retrieval/   描述/规格向量、FTS5、RRF 融合与结构化约束
 src/profile/     会话画像存储（主链路使用 SQLite，保留语义记忆接口）
 src/cache/       Redis RAG 缓存
@@ -50,10 +50,20 @@ ChromaDB 或外网，可作为日常回归入口：
 python -m evals.runner --mode deterministic
 ```
 
+完整回归测试：
+
+```bash
+python -m pytest -q
+```
+
 内置 25 个中文案例，覆盖七类会话阶段、五类主 Agent 工具、检索触发、画像提取、
 工具异常和轮次上限。命令输出阶段正确率、工具边界、停止原因、检索行为、
 非空答复率及延迟分位数，JSON/Markdown 报告生成到已忽略的
 `evals/results/`。
+
+默认运行会校验 `evals/datasets/v1/manifest.json` 中声明的案例数量和 SHA-256，
+并执行 `agent-deterministic-regression` 质量门禁。报告会记录数据集版本、代码
+revision、Prompt 哈希、运行模式和稳定失败代码；质量门禁失败时命令返回非零退出码。
 
 Live 模式仅在主动配置模型密钥、商品 SQLite 和 ChromaDB 数据后运行，
 会产生真实模型调用费用，不作为默认测试门禁：
@@ -87,6 +97,20 @@ python -m src.embeddings.product_embedder
 ```bash
 python -m evals.retrieval_runner
 ```
+
+运行 RAG 评测前必须确认以下前置条件已经满足：
+
+- `PRODUCT_DB_PATH` 指向包含 `products` 表的商品 SQLite；
+- `PRODUCT_CHROMA_DIR` 下存在活动的 `product_descriptions`、`product_specs`
+  和 `product_reviews` 集合；
+- 如果使用版本化索引，`retrieval_manifest.json` 已指向完整且经过数量校验的集合；
+- `EMBEDDING_MODEL` 与索引构建时使用的模型兼容。
+
+缺少数据库或 Chroma 集合时，RAG 评测应报告为“环境前置条件缺失”，不能将其解释为
+Recall、来源覆盖率或约束安全指标为零。
+
+RAG runner 会在加载嵌入模型前执行只读前置检查。前置条件缺失时生成 `blocked` 报告
+并返回退出码 `2`；前置条件满足后才执行 `retrieval-safety` 质量门禁。
 
 案例集是确定性的质量契约；仓库不附带真实商品数据和索引，因此 README
 不预设或宣称线上 Recall 提升，指标应以目标环境实测结果为准。

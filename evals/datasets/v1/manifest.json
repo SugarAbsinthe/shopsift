@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "dataset_version": "v1",
+  "created_at": "2026-09-14",
+  "description": "ShopSift Phase 0 evaluation dataset manifest",
+  "cases": [
+    {
+      "id": "agent-behavior-v1",
+      "path": "evals/cases.jsonl",
+      "format": "jsonl",
+      "case_count": 25,
+      "sha256": "8A6C02E4DE3985F253CC2131A8D295D3A26DFDBB57F226A49C196210A638CF9C",
+      "scope": [
+        "stage routing",
+        "tool boundaries",
+        "retrieval trigger",
+        "profile extraction",
+        "tool errors",
+        "tool round limits"
+      ]
+    },
+    {
+      "id": "retrieval-contract-v1",
+      "path": "evals/retrieval_cases.jsonl",
+      "format": "jsonl",
+      "case_count": 30,
+      "sha256": "479D0D9F8905D1A6D9CE93606AFA9DDF933E795C07F1229C570078C6943AFB48",
+      "scope": [
+        "recall",
+        "source coverage",
+        "forbidden products",
+        "hard constraints",
+        "expected empty results"
+      ],
+      "runtime_preconditions": [
+        "PRODUCT_DB_PATH points to a database containing products",
+        "product_descriptions, product_specs and product_reviews collections exist",
+        "active retrieval manifest is valid when versioned indexes are used"
+      ]
+    }
+  ],
+  "quality_gates": [
+    {
+      "name": "agent-deterministic-regression",
+      "mode": "deterministic",
+      "dataset_id": "agent-behavior-v1",
+      "minimums": {
+        "pass_rate": 1.0,
+        "stage_accuracy": 1.0,
+        "tool_boundary_accuracy": 1.0,
+        "stop_reason_accuracy": 1.0,
+        "retrieval_accuracy": 1.0,
+        "nonempty_answer_rate": 1.0
+      },
+      "maximums": {
+        "failed": 0,
+        "illegal_tool_calls": 0
+      }
+    },
+    {
+      "name": "retrieval-safety",
+      "mode": "retrieval",
+      "dataset_id": "retrieval-contract-v1",
+      "maximums": {
+        "forbidden_violations": 0,
+        "constraint_violations": 0,
+        "empty_result_violations": 0
+      }
+    }
+  ],
+  "interpretation": {
+    "deterministic": "Controlled execution contract; not a real-model quality score.",
+    "retrieval": "Must be reported as blocked when data/index preconditions are missing, not as zero quality.",
+    "live": "Any future live dataset must record model, provider, prompt version, index version, cost and timestamp."
+  }
+}

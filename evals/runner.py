@@ -21,7 +21,26 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool
 
 from evals.schema import DEFAULT_CASES_PATH, EvalCase, VALID_TOOLS, load_cases
+from evals.quality import (
+    DEFAULT_DATASET_MANIFEST_PATH,
+    GateResult,
+    build_run_metadata,
+    default_zero_failure_gate,
+    evaluation_start,
+    evaluate_quality_gate,
+    get_quality_gate,
+    validate_dataset_artifact,
+)
 from src.agent.langgraph_engine import ShoppingGuideGraph
+
+
+def _failure(
+    failures: list[str], codes: list[str], code: str, message: str
+) -> None:
+    """Append a user-readable failure and one stable machine code."""
+    failures.append(message)
+    if code not in codes:
+        codes.append(code)
 
 
 @dataclass
@@ -36,6 +55,7 @@ class CaseResult:
     answer_nonempty: bool
     latency_ms: int
     failures: list[str] = field(default_factory=list)
+    failure_codes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -52,6 +72,7 @@ class EvalSummary:
     illegal_tool_calls: int
     latency_p50_ms: int
     latency_p95_ms: int
+    failure_counts: dict[str, int] = field(default_factory=dict)
 
 
 class ScriptedEvalLLM:
@@ -151,28 +172,49 @@ def run_deterministic_case(case: EvalCase) -> CaseResult:
     retriever = RecordingRetriever(case.retriever_error)
     profile_store = RecordingProfileStore()
     tool_recorder = ToolRecorder(case.failing_tools)
-    graph = ShoppingGuideGraph(
-        llm=llm,
-        tools=tool_recorder.build_tools(),
-        product_retriever=retriever,
-        profile_store=profile_store,
-        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
-        stage_classifier_prompt=(
-            "current={current_stage}\nmessage={user_message}\nreturn one stage"
-        ),
-        max_tool_rounds=case.max_tool_rounds,
-    )
-
     started_at = time.perf_counter()
+    graph = None
+    result = None
+    execution_error = ""
     try:
+        graph = ShoppingGuideGraph(
+            llm=llm,
+            tools=tool_recorder.build_tools(),
+            product_retriever=retriever,
+            profile_store=profile_store,
+            system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+            stage_classifier_prompt=(
+                "current={current_stage}\nmessage={user_message}\nreturn one stage"
+            ),
+            max_tool_rounds=case.max_tool_rounds,
+        )
         result = graph.run(
             user_message=case.question,
             conv_id=f"eval-{case.id}",
             chat_history=_to_history(case),
         )
+    except Exception as exc:
+        # Do not expose exception details from an evaluation fixture or provider.
+        execution_error = type(exc).__name__
     finally:
-        graph.close()
+        if graph is not None:
+            graph.close()
     latency_ms = round((time.perf_counter() - started_at) * 1000)
+
+    if result is None:
+        return CaseResult(
+            case_id=case.id,
+            passed=False,
+            stage="",
+            tools=list(tool_recorder.calls),
+            stop_reason="",
+            retrieval_triggered=bool(retriever.calls),
+            profile_keys=sorted(profile_store.values),
+            answer_nonempty=False,
+            latency_ms=latency_ms,
+            failures=[f"execution error: {execution_error or 'UnknownError'}"],
+            failure_codes=["EXECUTION_ERROR"],
+        )
 
     answer = ""
     for message in reversed(result["messages"]):
@@ -186,29 +228,56 @@ def run_deterministic_case(case: EvalCase) -> CaseResult:
     observed_tools = tool_recorder.calls
     profile_keys = sorted(profile_store.values)
     failures: list[str] = []
+    failure_codes: list[str] = []
 
     if stage not in case.expected_stages:
-        failures.append(f"stage={stage!r}, expected one of {case.expected_stages}")
+        _failure(
+            failures,
+            failure_codes,
+            "STAGE_MISMATCH",
+            f"stage={stage!r}, expected one of {case.expected_stages}",
+        )
     missing_tools = sorted(set(case.required_tools) - set(observed_tools))
     if missing_tools:
-        failures.append(f"missing required tools: {missing_tools}")
+        _failure(
+            failures,
+            failure_codes,
+            "REQUIRED_TOOL_MISSING",
+            f"missing required tools: {missing_tools}",
+        )
     forbidden_tools = sorted(set(case.forbidden_tools) & set(observed_tools))
     if forbidden_tools:
-        failures.append(f"called forbidden tools: {forbidden_tools}")
+        _failure(
+            failures,
+            failure_codes,
+            "FORBIDDEN_TOOL_CALLED",
+            f"called forbidden tools: {forbidden_tools}",
+        )
     if stop_reason not in case.expected_stop_reasons:
-        failures.append(
-            f"stop_reason={stop_reason!r}, expected one of {case.expected_stop_reasons}"
+        _failure(
+            failures,
+            failure_codes,
+            "STOP_REASON_MISMATCH",
+            f"stop_reason={stop_reason!r}, expected one of {case.expected_stop_reasons}",
         )
     if retrieval_triggered != case.expected_retrieval:
-        failures.append(
+        _failure(
+            failures,
+            failure_codes,
+            "RETRIEVAL_TRIGGER_MISMATCH",
             f"retrieval_triggered={retrieval_triggered}, "
-            f"expected {case.expected_retrieval}"
+            f"expected {case.expected_retrieval}",
         )
     missing_profile_keys = sorted(set(case.expected_profile_keys) - set(profile_keys))
     if missing_profile_keys:
-        failures.append(f"missing profile keys: {missing_profile_keys}")
+        _failure(
+            failures,
+            failure_codes,
+            "PROFILE_KEY_MISSING",
+            f"missing profile keys: {missing_profile_keys}",
+        )
     if not answer:
-        failures.append("final answer is empty")
+        _failure(failures, failure_codes, "EMPTY_ANSWER", "final answer is empty")
 
     return CaseResult(
         case_id=case.id,
@@ -221,6 +290,7 @@ def run_deterministic_case(case: EvalCase) -> CaseResult:
         answer_nonempty=bool(answer),
         latency_ms=latency_ms,
         failures=failures,
+        failure_codes=failure_codes,
     )
 
 
@@ -264,6 +334,10 @@ def summarize(cases: Sequence[EvalCase], results: Sequence[CaseResult]) -> EvalS
         for case, result in zip(cases, results)
     )
     latencies = [result.latency_ms for result in results]
+    failure_counts: dict[str, int] = {}
+    for result in results:
+        for code in result.failure_codes:
+            failure_counts[code] = failure_counts.get(code, 0) + 1
     return EvalSummary(
         total=total,
         passed=passed,
@@ -277,6 +351,7 @@ def summarize(cases: Sequence[EvalCase], results: Sequence[CaseResult]) -> EvalS
         illegal_tool_calls=illegal_calls,
         latency_p50_ms=_percentile(latencies, 0.50),
         latency_p95_ms=_percentile(latencies, 0.95),
+        failure_counts=dict(sorted(failure_counts.items())),
     )
 
 
@@ -290,6 +365,8 @@ def write_reports(
     results: Sequence[CaseResult],
     output_dir: Path | str,
     mode: str = "deterministic",
+    metadata: dict | None = None,
+    gate: GateResult | None = None,
 ) -> tuple[Path, Path]:
     report_dir = Path(output_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -299,7 +376,10 @@ def write_reports(
     json_path.write_text(
         json.dumps(
             {
+                "report_schema_version": 1,
                 "mode": mode,
+                "metadata": metadata or {},
+                "gate": gate.to_dict() if gate else None,
                 "summary": asdict(summary),
                 "results": [asdict(result) for result in results],
             },
@@ -325,14 +405,41 @@ def write_reports(
         f"| Non-empty answer rate | {summary.nonempty_answer_rate:.1%} |",
         f"| Illegal tool calls | {summary.illegal_tool_calls} |",
         f"| Latency p50 / p95 | {summary.latency_p50_ms} / {summary.latency_p95_ms} ms |",
-        "",
-        "## Failures",
+        f"| Failure codes | {', '.join(f'{key}: {value}' for key, value in summary.failure_counts.items()) or 'none'} |",
         "",
     ]
+    if metadata:
+        dataset = metadata.get("dataset", {})
+        lines.extend([
+            "## Run metadata",
+            "",
+            f"- Report schema: `{metadata.get('report_schema_version', 1)}`",
+            f"- Dataset: `{dataset.get('dataset_id', 'ad-hoc')}` / `{dataset.get('dataset_version', 'unversioned')}`",
+            f"- Dataset SHA-256: `{dataset.get('sha256', 'unknown')}`",
+            f"- Code revision: `{metadata.get('code', {}).get('git_revision') or 'unknown'}`",
+            f"- Worktree dirty: `{metadata.get('code', {}).get('worktree_dirty')}`",
+            f"- Model/provider: `{metadata.get('runtime', {}).get('model', 'unknown')}` / `{metadata.get('runtime', {}).get('provider', 'unknown')}`",
+            f"- External access: `{metadata.get('runtime', {}).get('external_access')}`",
+            "",
+        ])
+    if gate:
+        lines.extend([
+            "## Quality gate",
+            "",
+            f"- `{gate.name}`: **{'passed' if gate.passed else 'failed'}**",
+        ])
+        if gate.failures:
+            lines.extend(f"- {failure}" for failure in gate.failures)
+        lines.append("")
+    lines.extend([
+        "## Failures",
+        "",
+    ])
     failed = [result for result in results if not result.passed]
     if failed:
         for result in failed:
-            lines.append(f"- `{result.case_id}`: {'; '.join(result.failures)}")
+            codes = f" [{', '.join(result.failure_codes)}]" if result.failure_codes else ""
+            lines.append(f"- `{result.case_id}`{codes}: {'; '.join(result.failures)}")
     else:
         lines.append("No failures.")
     markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -373,8 +480,10 @@ def run_live_case(agent, case: EvalCase) -> CaseResult:
     latency_ms = round((time.perf_counter() - started_at) * 1000)
     if result is None:
         failures = [execution_failure or "execution failed"]
+        failure_codes = ["EXECUTION_ERROR"]
         if cleanup_failure:
             failures.append("evaluation state cleanup failed")
+            failure_codes.append("CLEANUP_ERROR")
         return CaseResult(
             case_id=case.id,
             passed=False,
@@ -386,6 +495,7 @@ def run_live_case(agent, case: EvalCase) -> CaseResult:
             answer_nonempty=False,
             latency_ms=latency_ms,
             failures=failures,
+            failure_codes=failure_codes,
         )
 
     stage = result.get("stage", "")
@@ -394,31 +504,68 @@ def run_live_case(agent, case: EvalCase) -> CaseResult:
     retrieval_triggered = bool(result.get("retrieval_triggered", False))
     answer_nonempty = bool(str(result.get("answer", "")).strip())
     failures: list[str] = []
+    failure_codes: list[str] = []
     if stage not in case.expected_stages:
-        failures.append(f"stage={stage!r}, expected one of {case.expected_stages}")
+        _failure(
+            failures,
+            failure_codes,
+            "STAGE_MISMATCH",
+            f"stage={stage!r}, expected one of {case.expected_stages}",
+        )
     missing_tools = sorted(set(case.required_tools) - set(tools))
     if missing_tools:
-        failures.append(f"missing required tools: {missing_tools}")
+        _failure(
+            failures,
+            failure_codes,
+            "REQUIRED_TOOL_MISSING",
+            f"missing required tools: {missing_tools}",
+        )
     forbidden_tools = sorted(set(case.forbidden_tools) & set(tools))
     if forbidden_tools:
-        failures.append(f"called forbidden tools: {forbidden_tools}")
+        _failure(
+            failures,
+            failure_codes,
+            "FORBIDDEN_TOOL_CALLED",
+            f"called forbidden tools: {forbidden_tools}",
+        )
     if stop_reason not in case.expected_stop_reasons:
-        failures.append(
+        _failure(
+            failures,
+            failure_codes,
+            "STOP_REASON_MISMATCH",
             f"stop_reason={stop_reason!r}, expected one of {case.expected_stop_reasons}"
         )
     if retrieval_triggered != case.expected_retrieval:
-        failures.append(
+        _failure(
+            failures,
+            failure_codes,
+            "RETRIEVAL_TRIGGER_MISMATCH",
             f"retrieval_triggered={retrieval_triggered}, expected {case.expected_retrieval}"
         )
     missing_profile_keys = sorted(set(case.expected_profile_keys) - set(profile_keys))
     if missing_profile_keys:
-        failures.append(f"missing profile keys: {missing_profile_keys}")
+        _failure(
+            failures,
+            failure_codes,
+            "PROFILE_KEY_MISSING",
+            f"missing profile keys: {missing_profile_keys}",
+        )
     if not answer_nonempty:
-        failures.append("final answer is empty")
+        _failure(failures, failure_codes, "EMPTY_ANSWER", "final answer is empty")
     if profile_inspection_failure:
-        failures.append("profile inspection failed")
+        _failure(
+            failures,
+            failure_codes,
+            "PROFILE_INSPECTION_ERROR",
+            "profile inspection failed",
+        )
     if cleanup_failure:
-        failures.append("evaluation state cleanup failed")
+        _failure(
+            failures,
+            failure_codes,
+            "CLEANUP_ERROR",
+            "evaluation state cleanup failed",
+        )
 
     return CaseResult(
         case_id=case.id,
@@ -431,6 +578,7 @@ def run_live_case(agent, case: EvalCase) -> CaseResult:
         answer_nonempty=answer_nonempty,
         latency_ms=result.get("latency_ms", latency_ms),
         failures=failures,
+        failure_codes=failure_codes,
     )
 
 
@@ -465,6 +613,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode", choices=("deterministic", "live"), default="deterministic"
     )
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES_PATH)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Versioned dataset manifest; auto-selected for the default case file.",
+    )
+    parser.add_argument(
+        "--dataset-id",
+        default=None,
+        help="Dataset artifact id declared by --manifest.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("evals/results"))
     parser.add_argument(
         "--case-id",
@@ -481,7 +640,33 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    cases = load_cases(args.cases)
+    default_cases = args.cases.resolve() == DEFAULT_CASES_PATH.resolve()
+    manifest_path = args.manifest
+    if manifest_path is None and default_cases:
+        manifest_path = DEFAULT_DATASET_MANIFEST_PATH
+
+    dataset = None
+    manifest = None
+    dataset_id = args.dataset_id
+    if manifest_path is not None:
+        if not dataset_id:
+            dataset_id = "agent-behavior-v1" if default_cases else None
+        if not dataset_id:
+            print("--dataset-id is required when --manifest is used with custom cases")
+            return 2
+        try:
+            manifest, dataset = validate_dataset_artifact(
+                manifest_path, dataset_id, args.cases
+            )
+        except ValueError as exc:
+            print(f"evaluation manifest unavailable: {exc}")
+            return 2
+
+    try:
+        cases = load_cases(args.cases)
+    except ValueError as exc:
+        print(f"evaluation cases unavailable: {exc}")
+        return 2
     if args.case_id:
         selected_ids = set(args.case_id)
         cases = [case for case in cases if case.id in selected_ids]
@@ -497,6 +682,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not cases:
         print("no evaluation cases selected")
         return 2
+    started_at_monotonic, started_at = evaluation_start()
     from backend.logging_config import logger as telemetry_logger
     original_level = telemetry_logger.level
     if not args.verbose:
@@ -512,17 +698,46 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 2
     finally:
         telemetry_logger.setLevel(original_level)
+
+    metrics = asdict(summary)
+    gate_spec = (
+        get_quality_gate(manifest, dataset_id, args.mode)
+        if manifest is not None and dataset_id
+        else None
+    )
+    gate = (
+        evaluate_quality_gate(metrics, gate_spec)
+        if gate_spec is not None
+        else default_zero_failure_gate(metrics, args.mode)
+    )
+    metadata = build_run_metadata(
+        mode=args.mode,
+        started_at_monotonic=started_at_monotonic,
+        started_at=started_at,
+        dataset=dataset,
+        cases_path=args.cases,
+        model="scripted-eval" if args.mode == "deterministic" else "configured",
+        provider="local-double" if args.mode == "deterministic" else "configured",
+        external_access=args.mode == "live",
+    )
+    metadata["dataset"]["selected_case_count"] = len(cases)
     json_path, markdown_path = write_reports(
-        summary, results, args.output_dir, mode=args.mode
+        summary,
+        results,
+        args.output_dir,
+        mode=args.mode,
+        metadata=metadata,
+        gate=gate,
     )
     print(
         f"{args.mode}: {summary.passed}/{summary.total} passed "
-        f"({summary.pass_rate:.1%}); reports: {json_path}, {markdown_path}"
+        f"({summary.pass_rate:.1%}); gate={'passed' if gate.passed else 'failed'}; "
+        f"reports: {json_path}, {markdown_path}"
     )
     for result in results:
         if not result.passed:
             print(f"FAIL {result.case_id}: {'; '.join(result.failures)}")
-    return 0 if summary.failed == 0 else 1
+    return 0 if gate.passed else 1
 
 
 if __name__ == "__main__":
