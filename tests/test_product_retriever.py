@@ -107,6 +107,18 @@ def test_search_always_runs_three_recall_channels_and_returns_full_fields(tmp_pa
     assert result.products[0].product_id == 1
     assert result.products[0].price == 7999
     assert result.products[0].specs["GPU"] == "RTX 4060"
+    assert result.constraints == RetrievalQuery(text="RTX 4060", top_k=2).constraints
+    assert [item.evidence_id for item in result.evidence] == [
+        "catalog:legacy:1:product_id",
+        "catalog:legacy:1:price",
+        "catalog:legacy:1:brand",
+        "catalog:legacy:1:category",
+        "catalog:legacy:2:product_id",
+        "catalog:legacy:2:price",
+        "catalog:legacy:2:brand",
+        "catalog:legacy:2:category",
+    ]
+    assert all("RTX 4060" not in str(item.model_dump()) for item in result.evidence)
 
 
 def test_hard_constraints_override_rank_and_brand_preference(tmp_path):

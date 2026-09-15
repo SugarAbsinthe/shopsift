@@ -1,6 +1,8 @@
 """Redis-based RAG result cache for ProductRetriever.
 
-Caches the final formatted retrieval context keyed by (query, top_k) hash.
+Caches a versioned serialized retrieval result keyed by the full retrieval
+request. The caller can format that result for prompts without losing the
+structured evidence needed for deterministic checks.
 On Redis miss or Redis-unavailable, falls through gracefully to normal retrieval.
 """
 

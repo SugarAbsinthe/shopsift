@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 RetrievalSource = Literal["description", "spec", "sparse"]
+EvidenceField = Literal["product_id", "price", "brand", "category"]
 
 
 class RetrievalConstraints(BaseModel):
@@ -87,7 +88,37 @@ class RetrievalStats(BaseModel):
     duration_ms: int = 0
 
 
+class EvidenceItem(BaseModel):
+    """A deterministic catalog fact used to audit a retrieval result."""
+
+    evidence_id: str = Field(min_length=1, max_length=200)
+    product_id: int
+    source_type: Literal["catalog"] = "catalog"
+    field: EvidenceField
+    value: str | int | float
+    source_rank: int | None = Field(default=None, ge=1)
+    index_version: str = Field(default="legacy", min_length=1, max_length=100)
+
+
+VerificationStatus = Literal["verified", "failed", "not_applicable"]
+
+
+class VerificationResult(BaseModel):
+    """Outcome of deterministic checks over an Agent answer."""
+
+    status: VerificationStatus = "not_applicable"
+    failure_codes: list[str] = Field(default_factory=list)
+    checked_product_ids: list[int] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "verified"
+
+
 class RetrievalResult(BaseModel):
     products: list[ProductCandidate] = Field(default_factory=list)
     reviews_by_product: dict[int, list[dict[str, str]]] = Field(default_factory=dict)
     stats: RetrievalStats = Field(default_factory=RetrievalStats)
+    constraints: RetrievalConstraints = Field(default_factory=RetrievalConstraints)
+    evidence: list[EvidenceItem] = Field(default_factory=list)

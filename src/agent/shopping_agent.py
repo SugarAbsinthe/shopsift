@@ -173,8 +173,19 @@ class ShoppingGuideAgent:
         user_profile = self.profile_store.serialize_profile(conv_id)
 
         # Quick product search
+        retrieval_result = {}
         try:
-            product_context = self.product_retriever.retrieve(question, top_k=5)
+            structured_retriever = getattr(self.product_retriever, "retrieve_result", None)
+            if structured_retriever is not None:
+                retrieval_result = structured_retriever(question, top_k=5)
+                formatter = getattr(self.product_retriever, "format_result", None)
+                product_context = (
+                    formatter(retrieval_result)
+                    if formatter is not None
+                    else self.product_retriever.retrieve(question, top_k=5)
+                )
+            else:
+                product_context = self.product_retriever.retrieve(question, top_k=5)
         except Exception:
             product_context = "(产品检索暂不可用)"
 
@@ -191,6 +202,11 @@ class ShoppingGuideAgent:
             "product_context": product_context,
             "question": question,
         })
+        from src.retrieval.verifier import verify_answer
+
+        verification = verify_answer(answer, retrieval_result)
+        if verification.status == "failed":
+            answer = "当前信息不足以确认产品或价格，请调整条件后重试。"
 
         return {
             "answer": answer,
@@ -199,4 +215,10 @@ class ShoppingGuideAgent:
             "user_profile": user_profile,
             "messages": [],
             "tool_rounds": 0,
+            "retrieval_result": (
+                retrieval_result.model_dump()
+                if hasattr(retrieval_result, "model_dump")
+                else retrieval_result
+            ),
+            "verification": verification.model_dump(),
         }

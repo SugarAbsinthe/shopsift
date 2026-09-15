@@ -23,7 +23,7 @@ from src.retrieval.models import (
 from src.retrieval.index_manifest import resolve_collection_names
 
 
-RETRIEVAL_ALGORITHM_VERSION = "hybrid-rrf-v1"
+RETRIEVAL_ALGORITHM_VERSION = "hybrid-rrf-v2-evidence"
 RRF_K = 60
 
 
@@ -328,12 +328,48 @@ class ProductRetriever:
         from backend.logging_config import record_retrieval_stats
 
         record_retrieval_stats(stats)
-        return RetrievalResult(products=products, reviews_by_product=reviews, stats=stats)
+        evidence = self._build_evidence(products, stats.index_version)
+        return RetrievalResult(
+            products=products,
+            reviews_by_product=reviews,
+            stats=stats,
+            constraints=request.constraints,
+            evidence=evidence,
+        )
 
-    def retrieve(
+    @staticmethod
+    def _build_evidence(
+        products: list[ProductCandidate], index_version: str
+    ) -> list:
+        """Build stable catalog facts without copying user query text."""
+        from src.retrieval.models import EvidenceItem
+
+        evidence: list[EvidenceItem] = []
+        for product in products:
+            source_rank = min(product.source_ranks.values()) if product.source_ranks else None
+            values = {
+                "product_id": product.product_id,
+                "price": product.price,
+                "brand": product.brand,
+                "category": product.category,
+            }
+            for field, value in values.items():
+                if value is None or value == "":
+                    continue
+                evidence.append(EvidenceItem(
+                    evidence_id=f"catalog:{index_version}:{product.product_id}:{field}",
+                    product_id=product.product_id,
+                    field=field,
+                    value=value,
+                    source_rank=source_rank,
+                    index_version=index_version,
+                ))
+        return evidence
+
+    def retrieve_result(
         self, query: str, top_k: int = 5, filters: Optional[dict] = None
-    ) -> str:
-        """Compatibility API used by the Agent and search tool."""
+    ) -> RetrievalResult:
+        """Return structured results while preserving the existing cache path."""
         cache_args = (
             query,
             top_k,
@@ -344,23 +380,40 @@ class ProductRetriever:
         if self._cache is not None:
             cached = self._cache.get(*cache_args)
             if cached is not None:
-                from backend.logging_config import log, mark_cache_hit
+                try:
+                    result = RetrievalResult.model_validate(json.loads(cached))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    result = None
+                if result is not None:
+                    from backend.logging_config import log, mark_cache_hit
 
-                mark_cache_hit()
-                log("rag_cache_hit")
-                return cached
+                    mark_cache_hit()
+                    log("rag_cache_hit")
+                    return result
+
         result = self.search(query, top_k=top_k, filters=filters)
-        formatted = self._format_for_prompt(result.products, result.reviews_by_product)
         if self._cache is not None:
             self._cache.set(
                 query,
                 top_k,
-                formatted,
+                json.dumps(result.model_dump(), ensure_ascii=False, separators=(",", ":")),
                 filters,
                 self.index_version,
                 RETRIEVAL_ALGORITHM_VERSION,
             )
+        return result
+
+    def retrieve(
+        self, query: str, top_k: int = 5, filters: Optional[dict] = None
+    ) -> str:
+        """Compatibility API used by the Agent and search tool."""
+        result = self.retrieve_result(query, top_k=top_k, filters=filters)
+        formatted = self._format_for_prompt(result.products, result.reviews_by_product)
         return formatted
+
+    def format_result(self, result: RetrievalResult) -> str:
+        """Format a structured result for the legacy prompt context."""
+        return self._format_for_prompt(result.products, result.reviews_by_product)
 
     def _format_for_prompt(
         self,

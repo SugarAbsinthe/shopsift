@@ -29,6 +29,8 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from src.retrieval.models import RetrievalResult, VerificationResult
+from src.retrieval.verifier import verify_answer
 
 from backend.logging_config import (
     Timer,
@@ -54,6 +56,9 @@ class ShoppingState(TypedDict, total=False):
     agent_rounds: int
     stop_reason: str
     profile_constraints: dict
+    retrieval_result: dict
+    evidence: list[dict]
+    verification: dict
 
 
 class ShoppingGuideGraph:
@@ -161,7 +166,7 @@ class ShoppingGuideGraph:
 
         # Only search products in relevant stages
         if stage not in ("search", "comparison", "recommendation", "objection_handling"):
-            return {"product_context": ""}
+            return {"product_context": "", "retrieval_result": {}, "evidence": []}
 
         # Build profile-augmented query from last user message
         last_user_msg = ""
@@ -171,7 +176,7 @@ class ShoppingGuideGraph:
                 break
 
         if not last_user_msg:
-            return {"product_context": ""}
+            return {"product_context": "", "retrieval_result": {}, "evidence": []}
 
         mark_retrieval()
 
@@ -184,13 +189,29 @@ class ShoppingGuideGraph:
             retrieve_kwargs = {"top_k": 5}
             if profile_constraints:
                 retrieve_kwargs["filters"] = profile_constraints
-            product_context = self.product_retriever.retrieve(
-                augmented_query, **retrieve_kwargs
-            )
+            structured_retriever = getattr(self.product_retriever, "retrieve_result", None)
+            if structured_retriever is not None:
+                retrieval_result = structured_retriever(augmented_query, **retrieve_kwargs)
+                if not isinstance(retrieval_result, RetrievalResult):
+                    retrieval_result = RetrievalResult.model_validate(retrieval_result)
+                formatter = getattr(self.product_retriever, "format_result", None)
+                product_context = (
+                    formatter(retrieval_result)
+                    if formatter is not None
+                    else self.product_retriever.retrieve(augmented_query, **retrieve_kwargs)
+                )
+                return {
+                    "product_context": product_context,
+                    "retrieval_result": retrieval_result.model_dump(
+                        exclude={"reviews_by_product"}
+                    ),
+                    "evidence": [item.model_dump() for item in retrieval_result.evidence],
+                }
+            product_context = self.product_retriever.retrieve(augmented_query, **retrieve_kwargs)
         except Exception:
             product_context = "(产品检索暂时不可用)"
 
-        return {"product_context": product_context}
+        return {"product_context": product_context, "retrieval_result": {}, "evidence": []}
 
     def _invoke_with_retry(self, messages: list, max_retries: int = 3, model=None):
         """Invoke LLM with exponential backoff on transient failures.
@@ -222,6 +243,18 @@ class ShoppingGuideGraph:
         log("llm_fail", attempts=max_retries, error_type=type(last_exc).__name__)
         raise last_exc
 
+    @staticmethod
+    def _verify_response(response: AIMessage, state: ShoppingState) -> tuple[AIMessage, dict, str | None]:
+        """Verify only explicit catalog facts when structured retrieval exists."""
+        if getattr(response, "tool_calls", None):
+            result = VerificationResult(failure_codes=["tool_calls_pending"])
+            return response, result.model_dump(), None
+        result = verify_answer(response.content, state.get("retrieval_result"))
+        if result.status != "failed":
+            return response, result.model_dump(), None
+        safe_response = AIMessage(content="当前信息不足以确认产品或价格，请调整条件后重试。")
+        return safe_response, result.model_dump(), "verification_failed"
+
     def _agent_node(self, state: ShoppingState) -> dict:
         stage = state.get("stage", "discovery")
         user_profile = state.get("user_profile", "(暂无画像)")
@@ -242,6 +275,7 @@ class ShoppingGuideGraph:
         full_messages = [SystemMessage(content=system_text)] + list(state["messages"])
 
         response = self._invoke_with_retry(full_messages)
+        response, verification, verification_stop = self._verify_response(response, state)
         record_requested_tools(
             call.get("name", "") for call in (response.tool_calls or [])
         )
@@ -249,7 +283,9 @@ class ShoppingGuideGraph:
         return {
             "messages": [response],
             "agent_rounds": agent_rounds + 1,
+            "verification": verification,
             "stop_reason": (
+                verification_stop or
                 (state.get("stop_reason") or "completed")
                 if not response.tool_calls else ""
             ),
@@ -327,10 +363,12 @@ class ShoppingGuideGraph:
         response = self._invoke_with_retry(full_messages, model=self.llm)
         if not getattr(response, "content", ""):
             response = AIMessage(content="已达到工具调用上限，现有信息不足以形成可靠结论，请补充需求后重试。")
+        response, verification, verification_stop = self._verify_response(response, state)
         return {
             "messages": [*skipped_tool_messages, response],
             "agent_rounds": state.get("agent_rounds", 0) + 1,
-            "stop_reason": state.get("stop_reason") or "max_tool_rounds",
+            "verification": verification,
+            "stop_reason": verification_stop or state.get("stop_reason") or "max_tool_rounds",
         }
 
     # ---- Routing ----
@@ -574,6 +612,9 @@ class ShoppingGuideGraph:
             "tool_rounds": result.get("tool_rounds", 0),
             "agent_rounds": result.get("agent_rounds", 0),
             "stop_reason": result.get("stop_reason", "completed"),
+            "retrieval_result": result.get("retrieval_result", {}),
+            "evidence": result.get("evidence", []),
+            "verification": result.get("verification", {}),
             **telemetry.snapshot(),
         }
 
