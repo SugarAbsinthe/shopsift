@@ -97,7 +97,7 @@ class ScriptedEvalLLM:
             calls = [
                 {
                     "name": tool_name,
-                    "args": {"payload": "evaluation-fixture"},
+                    "args": self._tool_args(tool_name),
                     "id": f"{self.case.id}-{call_index}-{tool_index}",
                     "type": "tool_call",
                 }
@@ -107,6 +107,20 @@ class ScriptedEvalLLM:
             ]
             return AIMessage(content="", tool_calls=calls)
         return AIMessage(content=self.case.deterministic_answer)
+
+    def _tool_args(self, tool_name: str) -> dict:
+        conv_id = f"eval-{self.case.id}"
+        return {
+            "get_product_detail": {"product_id": 101},
+            "get_reviews": {"product_id": 101, "aspect": "", "top_k": 5},
+            "compare_products": {"product_ids": "101,102"},
+            "get_user_profile": {"conv_id": conv_id},
+            "update_user_profile": {
+                "conv_id": conv_id,
+                "key": "budget",
+                "value": "6000",
+            },
+        }[tool_name]
 
 
 class RecordingRetriever:
@@ -145,11 +159,27 @@ class ToolRecorder:
     def _build_tool(self, name: str) -> StructuredTool:
         recorder = self
 
-        def execute(payload: str = "evaluation-fixture") -> str:
+        def record() -> str:
             recorder.calls.append(name)
             if name in recorder.failing_tools:
                 raise RuntimeError(f"deterministic {name} failure")
             return f"{name} completed"
+
+        if name == "get_product_detail":
+            def execute(product_id: int) -> str:
+                return record()
+        elif name == "get_reviews":
+            def execute(product_id: int, aspect: str = "", top_k: int = 5) -> str:
+                return record()
+        elif name == "compare_products":
+            def execute(product_ids: str) -> str:
+                return record()
+        elif name == "get_user_profile":
+            def execute(conv_id: str) -> str:
+                return record()
+        else:
+            def execute(conv_id: str, key: str, value: str) -> str:
+                return record()
 
         return StructuredTool.from_function(
             func=execute,
