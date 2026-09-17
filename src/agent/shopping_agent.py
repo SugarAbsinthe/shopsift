@@ -15,7 +15,6 @@ from src.agent.shopping_tools import (
     create_get_reviews,
     create_compare_products,
     create_get_user_profile,
-    create_update_user_profile,
 )
 from src.agent.shopping_prompts import (
     SHOPPING_SYSTEM_PROMPT,
@@ -59,7 +58,6 @@ class ShoppingGuideAgent:
             create_get_reviews(self.reviews_db),
             create_compare_products(self.catalog_db),
             create_get_user_profile(profile_store),
-            create_update_user_profile(profile_store),
         ]
 
         # Per-stage prompt mapping: the agent node dynamically selects

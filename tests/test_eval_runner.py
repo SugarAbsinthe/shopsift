@@ -134,7 +134,7 @@ class FakeLiveAgent:
         return {
             "answer": "已记录预算。",
             "stage": "needs_elicitation",
-            "executed_tools": ["update_user_profile"],
+            "executed_tools": [],
             "stop_reason": "completed",
             "retrieval_triggered": False,
             "latency_ms": 42,
@@ -149,10 +149,8 @@ def test_live_mode_uses_shared_expectations_and_cleans_state():
         "id": "live_profile",
         "question": "预算6000元，请记住",
         "expected_stages": ["needs_elicitation"],
-        "required_tools": ["update_user_profile"],
         "expected_retrieval": False,
         "expected_profile_keys": ["budget"],
-        "scripted_tool_rounds": [["update_user_profile"]],
     })
     agent = FakeLiveAgent()
     summary, results = run_live([case], agent=agent)
@@ -189,9 +187,7 @@ def test_live_mode_marks_profile_inspection_failure_and_still_cleans():
         "id": "profile_inspection_failure",
         "question": "预算6000元，请记住",
         "expected_stages": ["needs_elicitation"],
-        "required_tools": ["update_user_profile"],
         "expected_retrieval": False,
-        "scripted_tool_rounds": [["update_user_profile"]],
     })
     _, results = run_live([case], agent=agent)
     assert "profile inspection failed" in results[0].failures

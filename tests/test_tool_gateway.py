@@ -36,7 +36,7 @@ def test_registry_describes_the_real_profile_write_boundary():
     assert spec.allowed_stages == frozenset({"discovery", "needs_elicitation"})
     assert set(spec.argument_schema) == {"conv_id", "key", "value"}
     assert spec.timeout_ms == 0
-    assert spec.approval_required is False
+    assert spec.approval_required is True
 
 
 def test_duplicate_tool_names_fail_registration():

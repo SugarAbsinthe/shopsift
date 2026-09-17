@@ -65,6 +65,16 @@ class TestCreateUserProfile:
         result = tool.invoke({"conv_id": "test", "key": "budget", "value": "8000"})
         assert "未初始化" in result
 
+    def test_compatibility_update_is_governed_as_explicit(self):
+        store = Mock()
+        tool = create_update_user_profile(store)
+
+        tool.invoke({"conv_id": "test", "key": "preferred_brand", "value": "联想"})
+
+        store.update.assert_called_once_with(
+            "test", "preferred_brand", "联想", confidence=0.85, source="explicit"
+        )
+
 
 class TestCreateCompareProducts:
     def test_rejects_single_product(self, tmp_path):
@@ -93,6 +103,5 @@ def test_main_agent_does_not_register_duplicate_search_tool(tmp_path):
         "get_reviews",
         "compare_products",
         "get_user_profile",
-        "update_user_profile",
     }
     agent.close()

@@ -59,6 +59,16 @@ class TestStagePromptMapping:
         }:
             assert "search_products" not in prompt
 
+    def test_active_prompts_do_not_delegate_profile_writes_to_the_model(self):
+        for prompt in {
+            SHOPPING_SYSTEM_PROMPT,
+            DISCOVERY_AGENT_PROMPT,
+            SEARCH_AGENT_PROMPT,
+            COMPARE_AGENT_PROMPT,
+            RECOMMEND_AGENT_PROMPT,
+        }:
+            assert "update_user_profile" not in prompt
+
     def test_all_stage_prompts_include_style_guide(self):
         for name in ["DISCOVERY", "SEARCH", "COMPARE", "RECOMMEND"]:
             prompt = globals()[f"{name}_AGENT_PROMPT"]

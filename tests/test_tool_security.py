@@ -104,5 +104,6 @@ def test_malicious_product_text_cannot_expand_tool_authority_or_write_profile():
     assert prompt.count("<UNTRUSTED_PRODUCT_DATA>") == 1
     assert prompt.count("</UNTRUSTED_PRODUCT_DATA>") == 1
     assert "[UNTRUSTED_DATA_END_REMOVED]" in prompt
+    assert "profile values and evidence" in prompt
     assert prompt.index("Security boundary:") > prompt.index("</UNTRUSTED_PRODUCT_DATA>")
     graph.close()

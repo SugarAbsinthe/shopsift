@@ -16,6 +16,7 @@ from typing import Any, Iterable, Mapping
 from langchain_core.messages import ToolMessage
 
 from backend.logging_config import log
+from src.profile.models import PROFILE_KEYS
 
 
 KNOWN_STAGES = frozenset(
@@ -29,21 +30,6 @@ KNOWN_STAGES = frozenset(
         "summary",
     }
 )
-
-PROFILE_KEYS = frozenset(
-    {
-        "budget",
-        "primary_use",
-        "preferred_brand",
-        "mobility",
-        "must_have",
-        "exclude_brand",
-        "screen_preference",
-        "battery_requirement",
-        "product_category",
-    }
-)
-
 
 @dataclass(frozen=True)
 class ToolSpec:
@@ -123,6 +109,7 @@ def _known_spec(name: str) -> ToolSpec | None:
             },
             allowed_stages=frozenset({"discovery", "needs_elicitation"}),
             max_calls_per_run=4,
+            approval_required=True,
             # Do not pretend a thread timeout can cancel a write that already
             # started.  This local SQLite operation runs synchronously.
             timeout_ms=0,
@@ -277,10 +264,6 @@ class ToolGateway:
                 self._audit(tool=name, decision="deny", reason="stage_not_allowed", stage=stage, access=spec.access)
                 messages.append(self._error(call_id, name, "stage_not_allowed"))
                 continue
-            if spec.approval_required and call_id not in set(state.get("approved_tool_calls", []) or []):
-                self._audit(tool=name, decision="deny", reason="approval_required", stage=stage, access=spec.access)
-                messages.append(self._error(call_id, name, "approval_required"))
-                continue
             if counts.get(name, 0) >= spec.max_calls_per_run:
                 self._audit(tool=name, decision="deny", reason="call_limit", stage=stage, access=spec.access)
                 messages.append(self._error(call_id, name, "call_limit"))
@@ -297,6 +280,10 @@ class ToolGateway:
             if reason:
                 self._audit(tool=name, decision="deny", reason=reason, stage=stage, access=spec.access)
                 messages.append(self._error(call_id, name, reason))
+                continue
+            if spec.approval_required and call_id not in set(state.get("approved_tool_calls", []) or []):
+                self._audit(tool=name, decision="deny", reason="approval_required", stage=stage, access=spec.access)
+                messages.append(self._error(call_id, name, "approval_required"))
                 continue
 
             counts[name] = counts.get(name, 0) + 1

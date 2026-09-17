@@ -52,6 +52,7 @@ class CaseResult:
     stop_reason: str
     retrieval_triggered: bool
     profile_keys: list[str]
+    pending_profile_keys: list[str]
     answer_nonempty: bool
     latency_ms: int
     failures: list[str] = field(default_factory=list)
@@ -115,21 +116,16 @@ class ScriptedEvalLLM:
             "get_reviews": {"product_id": 101, "aspect": "", "top_k": 5},
             "compare_products": {"product_ids": "101,102"},
             "get_user_profile": {"conv_id": conv_id},
-            "update_user_profile": {
-                "conv_id": conv_id,
-                "key": "budget",
-                "value": "6000",
-            },
         }[tool_name]
 
 
 class RecordingRetriever:
     def __init__(self, should_fail: bool = False):
         self.should_fail = should_fail
-        self.calls: list[tuple[str, int]] = []
+        self.calls: list[tuple[str, int, dict | None]] = []
 
-    def retrieve(self, query: str, top_k: int = 5) -> str:
-        self.calls.append((query, top_k))
+    def retrieve(self, query: str, top_k: int = 5, filters: dict | None = None) -> str:
+        self.calls.append((query, top_k, filters))
         if self.should_fail:
             raise RuntimeError("deterministic retriever failure")
         return "产品101｜评测夹具商品｜价格 6999 元"
@@ -138,14 +134,40 @@ class RecordingRetriever:
 class RecordingProfileStore:
     def __init__(self):
         self.values: dict[str, str] = {}
+        self.pending: dict[str, str] = {}
 
     def serialize_profile(self, conv_id: str) -> str:
-        if not self.values:
+        if not self.values and not self.pending:
             return "(暂无画像)"
-        return "\n".join(f"{key}: {value}" for key, value in sorted(self.values.items()))
+        lines = [f"{key}: {value}" for key, value in sorted(self.values.items())]
+        lines.extend(
+            f"pending {key}: {value}" for key, value in sorted(self.pending.items())
+        )
+        return "\n".join(lines)
 
     def update(self, conv_id: str, key: str, value: str, **kwargs) -> None:
         self.values[key] = value
+
+    def add_candidate(
+        self,
+        conv_id: str,
+        key: str,
+        value: str,
+        *,
+        memory_type: str,
+        **kwargs,
+    ) -> None:
+        if memory_type == "explicit":
+            self.values[key] = value
+            self.pending.pop(key, None)
+        else:
+            self.pending[key] = value
+
+    def get_structured(self, conv_id: str) -> dict:
+        return {
+            key: {"value": value, "confidence": 1.0, "source": "explicit"}
+            for key, value in self.values.items()
+        }
 
 
 class ToolRecorder:
@@ -178,8 +200,7 @@ class ToolRecorder:
             def execute(conv_id: str) -> str:
                 return record()
         else:
-            def execute(conv_id: str, key: str, value: str) -> str:
-                return record()
+            raise ValueError(f"unsupported evaluation tool: {name}")
 
         return StructuredTool.from_function(
             func=execute,
@@ -240,6 +261,7 @@ def run_deterministic_case(case: EvalCase) -> CaseResult:
             stop_reason="",
             retrieval_triggered=bool(retriever.calls),
             profile_keys=sorted(profile_store.values),
+            pending_profile_keys=sorted(profile_store.pending),
             answer_nonempty=False,
             latency_ms=latency_ms,
             failures=[f"execution error: {execution_error or 'UnknownError'}"],
@@ -257,6 +279,7 @@ def run_deterministic_case(case: EvalCase) -> CaseResult:
     retrieval_triggered = bool(retriever.calls)
     observed_tools = tool_recorder.calls
     profile_keys = sorted(profile_store.values)
+    pending_profile_keys = sorted(profile_store.pending)
     failures: list[str] = []
     failure_codes: list[str] = []
 
@@ -306,6 +329,16 @@ def run_deterministic_case(case: EvalCase) -> CaseResult:
             "PROFILE_KEY_MISSING",
             f"missing profile keys: {missing_profile_keys}",
         )
+    missing_pending_keys = sorted(
+        set(case.expected_pending_profile_keys) - set(pending_profile_keys)
+    )
+    if missing_pending_keys:
+        _failure(
+            failures,
+            failure_codes,
+            "PENDING_PROFILE_KEY_MISSING",
+            f"missing pending profile keys: {missing_pending_keys}",
+        )
     if not answer:
         _failure(failures, failure_codes, "EMPTY_ANSWER", "final answer is empty")
 
@@ -317,6 +350,7 @@ def run_deterministic_case(case: EvalCase) -> CaseResult:
         stop_reason=stop_reason,
         retrieval_triggered=retrieval_triggered,
         profile_keys=profile_keys,
+        pending_profile_keys=pending_profile_keys,
         answer_nonempty=bool(answer),
         latency_ms=latency_ms,
         failures=failures,
@@ -485,6 +519,7 @@ def run_live_case(agent, case: EvalCase) -> CaseResult:
     profile_inspection_failure = False
     cleanup_failure = False
     profile_keys: list[str] = []
+    pending_profile_keys: list[str] = []
     try:
         result = agent.run(
             question=case.question,
@@ -499,6 +534,12 @@ def run_live_case(agent, case: EvalCase) -> CaseResult:
             get_structured = getattr(agent.profile_store, "get_structured", None)
             if get_structured:
                 profile_keys = sorted(get_structured(conv_id))
+            list_candidates = getattr(agent.profile_store, "list_candidates", None)
+            if list_candidates:
+                pending_profile_keys = sorted({
+                    candidate.key
+                    for candidate in list_candidates(conv_id, statuses=("pending",))
+                })
         except Exception:
             profile_inspection_failure = True
 
@@ -522,6 +563,7 @@ def run_live_case(agent, case: EvalCase) -> CaseResult:
             stop_reason="",
             retrieval_triggered=False,
             profile_keys=profile_keys,
+            pending_profile_keys=pending_profile_keys,
             answer_nonempty=False,
             latency_ms=latency_ms,
             failures=failures,
@@ -580,6 +622,16 @@ def run_live_case(agent, case: EvalCase) -> CaseResult:
             "PROFILE_KEY_MISSING",
             f"missing profile keys: {missing_profile_keys}",
         )
+    missing_pending_keys = sorted(
+        set(case.expected_pending_profile_keys) - set(pending_profile_keys)
+    )
+    if missing_pending_keys:
+        _failure(
+            failures,
+            failure_codes,
+            "PENDING_PROFILE_KEY_MISSING",
+            f"missing pending profile keys: {missing_pending_keys}",
+        )
     if not answer_nonempty:
         _failure(failures, failure_codes, "EMPTY_ANSWER", "final answer is empty")
     if profile_inspection_failure:
@@ -605,6 +657,7 @@ def run_live_case(agent, case: EvalCase) -> CaseResult:
         stop_reason=stop_reason,
         retrieval_triggered=retrieval_triggered,
         profile_keys=profile_keys,
+        pending_profile_keys=pending_profile_keys,
         answer_nonempty=answer_nonempty,
         latency_ms=result.get("latency_ms", latency_ms),
         failures=failures,

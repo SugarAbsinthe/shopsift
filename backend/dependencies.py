@@ -107,10 +107,12 @@ def clear_conversation_runtime(conv_id: str) -> None:
     if os.path.exists(config.PROFILE_DB_PATH):
         conn = sqlite3.connect(config.PROFILE_DB_PATH)
         try:
-            conn.execute("DELETE FROM user_profiles WHERE conv_id = ?", (conv_id,))
+            for table in ("user_profiles", "memory_candidates"):
+                try:
+                    conn.execute(f"DELETE FROM {table} WHERE conv_id = ?", (conv_id,))
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
-        except sqlite3.OperationalError:
-            pass
         finally:
             conn.close()
 

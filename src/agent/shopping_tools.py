@@ -5,7 +5,7 @@ Six tools mapped to the shopping guide domain:
   2. get_product_detail  — full spec sheet for one product
   3. get_reviews         — review snippets by product + aspect
   4. compare_products    — side-by-side comparison of 2-4 products
-  5. update_user_profile — write/update a profile key-value
+  5. update_user_profile — legacy compatibility write (approval-gated)
   6. get_user_profile    — read current effective profile
 """
 
@@ -218,8 +218,7 @@ def update_user_profile(conv_id: str, key: str, value: str) -> str:
     """
     if _profile_store is None:
         return "画像存储未初始化"
-    source = "explicit" if key in ("budget", "primary_use") else "deduced"
-    _profile_store.update(conv_id, key, value, confidence=0.85, source=source)
+    _profile_store.update(conv_id, key, value, confidence=0.85, source="explicit")
     return f"已更新用户画像: {key} = {value}"
 
 
@@ -452,8 +451,7 @@ def create_update_user_profile(profile_store):
         """
         if profile_store is None:
             return "画像存储未初始化"
-        source = "explicit" if key in ("budget", "primary_use") else "deduced"
-        profile_store.update(conv_id, key, value, confidence=0.85, source=source)
+        profile_store.update(conv_id, key, value, confidence=0.85, source="explicit")
         return f"已更新用户画像: {key} = {value}"
     return _update_user_profile
 

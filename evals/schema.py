@@ -29,7 +29,6 @@ ToolName = Literal[
     "get_reviews",
     "compare_products",
     "get_user_profile",
-    "update_user_profile",
 ]
 StopReason = Literal["completed", "tool_error", "max_tool_rounds"]
 
@@ -63,6 +62,7 @@ class EvalCase(BaseModel):
     )
     expected_retrieval: bool
     expected_profile_keys: list[str] = Field(default_factory=list)
+    expected_pending_profile_keys: list[str] = Field(default_factory=list)
     max_tool_rounds: int = Field(default=3, ge=1, le=10)
     scripted_tool_rounds: list[list[ToolName]] = Field(default_factory=list)
     failing_tools: list[ToolName] = Field(default_factory=list)
@@ -77,6 +77,7 @@ class EvalCase(BaseModel):
         "forbidden_tools",
         "expected_stop_reasons",
         "expected_profile_keys",
+        "expected_pending_profile_keys",
         "failing_tools",
         "tags",
     )

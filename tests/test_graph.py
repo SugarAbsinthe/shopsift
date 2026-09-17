@@ -113,7 +113,7 @@ class TestExtractProfileSignals:
         mock_store = Mock()
         extract_profile_signals("test_conv", message, mock_store)
         mock_store.update.assert_called_once_with(
-            "test_conv", "budget", expected, confidence=0.8, source="deduced"
+            "test_conv", "budget", expected, confidence=0.95, source="explicit"
         )
 
     def test_reversed_budget_range_is_not_silently_reordered(self):
@@ -241,6 +241,47 @@ def test_search_turn_retrieves_once_with_structured_hard_constraints():
         "category": "笔记本电脑",
         "excluded_brands": ["戴尔"],
     }
+    graph.close()
+
+
+def test_turn_local_constraints_do_not_leak_into_the_next_checkpointed_turn(tmp_path):
+    class RecordingRetriever:
+        def __init__(self):
+            self.filters = []
+
+        def retrieve(self, query, top_k=5, filters=None):
+            self.filters.append(filters or {})
+            return "context"
+
+    class ProfileStore:
+        def __init__(self):
+            self.values = {}
+
+        def update(self, conv_id, key, value, **kwargs):
+            self.values[key] = value
+
+        def serialize_profile(self, conv_id):
+            return "\n".join(f"- {key}: {value}" for key, value in self.values.items())
+
+        def get_structured(self, conv_id):
+            return {key: {"value": value} for key, value in self.values.items()}
+
+    retriever = RecordingRetriever()
+    graph = ShoppingGuideGraph(
+        llm=FakeToolLLM([AIMessage(content="final")]),
+        tools=[],
+        product_retriever=retriever,
+        profile_store=ProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+        checkpoint_db_path=str(tmp_path / "session-checkpoints.db"),
+    )
+
+    graph.run("这次预算6000元，推荐笔记本", "session-conv")
+    graph.run("再推荐几款笔记本", "session-conv")
+
+    assert retriever.filters[0] == {"max_price": 6000, "category": "笔记本电脑"}
+    assert retriever.filters[1] == {"category": "笔记本电脑"}
     graph.close()
 
 

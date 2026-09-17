@@ -9,12 +9,12 @@
       "path": "evals/cases.jsonl",
       "format": "jsonl",
       "case_count": 25,
-      "sha256": "8A6C02E4DE3985F253CC2131A8D295D3A26DFDBB57F226A49C196210A638CF9C",
+      "sha256": "12BBF5F0F589735DF551A2AD5138254BCC93D6E4F003CAF1D1A364978742BD71",
       "scope": [
         "stage routing",
         "tool boundaries",
         "retrieval trigger",
-        "profile extraction",
+        "profile candidate lifecycle",
         "tool errors",
         "tool round limits"
       ]
