@@ -14,11 +14,14 @@ from backend.logging_config import (
     logger,
     mark_cache_hit,
     mark_retrieval,
+    record_failure,
+    record_fallback,
     record_executed_tools,
     record_llm_response,
     record_llm_retry,
     record_retrieval_stats,
     record_requested_tools,
+    record_tool_policy,
     reset_request_id,
     run_context,
     set_request_id,
@@ -128,6 +131,53 @@ def test_run_telemetry_records_only_available_usage():
     assert snapshot["tool_errors"] == 1
     assert snapshot["retrieval_stats"]["returned_candidates"] == 3
     assert "query" not in snapshot["retrieval_stats"]
+
+
+def test_run_telemetry_records_versioned_cost_and_bounded_diagnostics():
+    telemetry = create_run_telemetry(
+        "run-diagnostics",
+        provider="compatible-provider",
+        model="test-model",
+        prompt_version="prompt-v1",
+        pricing_version="pricing-v1",
+        input_cost_per_million=1.0,
+        output_cost_per_million=2.0,
+    )
+    response = SimpleNamespace(
+        usage_metadata={"input_tokens": 1000, "output_tokens": 500},
+        response_metadata={},
+    )
+    with run_context(telemetry):
+        with Timer("graph_node", node="agent"):
+            pass
+        record_llm_response(response)
+        record_failure("model", "TimeoutError")
+        record_fallback("retrieval_unavailable")
+        record_tool_policy(
+            tool="get_product_detail",
+            decision="allow",
+            reason="policy_pass",
+            stage="search",
+            access="read_only",
+        )
+
+    snapshot = telemetry.snapshot()
+    assert snapshot["provider"] == "compatible-provider"
+    assert snapshot["model"] == "test-model"
+    assert snapshot["prompt_version"] == "prompt-v1"
+    assert snapshot["pricing_version"] == "pricing-v1"
+    assert snapshot["total_tokens"] == 1500
+    assert snapshot["estimated_cost_usd"] == 0.002
+    assert "agent" in snapshot["node_latency_ms"]
+    assert snapshot["failure_counts"] == {"model:TimeoutError": 1}
+    assert snapshot["fallbacks"] == ["retrieval_unavailable"]
+    assert snapshot["tool_policy"] == [{
+        "tool": "get_product_detail",
+        "decision": "allow",
+        "reason": "policy_pass",
+        "stage": "search",
+        "access": "read_only",
+    }]
 
 
 def test_langsmith_is_disabled_by_default(monkeypatch):

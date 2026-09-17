@@ -1,6 +1,8 @@
 """Test LangGraph routing and node logic without external LLM calls."""
 import asyncio
 import json
+import threading
+import time
 import pytest
 from unittest.mock import Mock, MagicMock
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -10,10 +12,13 @@ from langchain_core.tools import tool
 from src.agent.langgraph_engine import (
     ShoppingGuideGraph,
     ShoppingState,
+    RunCancelledError,
+    RunTimeBudgetExceeded,
     build_retrieval_constraints,
     classify_stage,
     parse_budget_expression,
 )
+from backend.logging_config import run_context
 
 
 def _make_tool_call_msg(tool_call_id="call_1", tool_name="search"):
@@ -359,6 +364,7 @@ def test_checkpoint_preserves_stage_across_graph_instances(tmp_path):
     )
     first_result = first.run("推荐游戏本", "persistent-conv")
     assert first_result["stage"] == "search"
+    assert first_result["checkpoint_restored"] is False
     first.close()
 
     second_llm = FakeToolLLM([AIMessage(content="second")])
@@ -373,6 +379,7 @@ def test_checkpoint_preserves_stage_across_graph_instances(tmp_path):
     )
     second_result = second.run("这个呢", "persistent-conv")
     assert second_result["stage"] == "search"
+    assert second_result["checkpoint_restored"] is True
     second.clear_thread("persistent-conv")
     second.close()
 
@@ -388,6 +395,7 @@ def test_checkpoint_preserves_stage_across_graph_instances(tmp_path):
     )
     reset_result = third.run("这个呢", "persistent-conv")
     assert reset_result["stage"] == "discovery"
+    assert reset_result["checkpoint_restored"] is False
     third.close()
 
 
@@ -498,4 +506,198 @@ def test_run_stream_emits_tool_lifecycle_events(tmp_path):
     assert done["requested_tools"] == ["search"]
     assert done["executed_tools"] == ["search"]
     assert done["tool_errors"] == 0
+    graph.close()
+
+
+class ProviderStatusError(RuntimeError):
+    def __init__(self, status_code):
+        super().__init__("provider unavailable")
+        self.status_code = status_code
+
+
+class FlakyLLM(FakeToolLLM):
+    def invoke(self, messages):
+        response = self.responses[min(self.calls, len(self.responses) - 1)]
+        self.calls += 1
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (TimeoutError("provider timeout"), "model:timeout"),
+        (ProviderStatusError(429), "model:http_429"),
+        (ProviderStatusError(502), "model:http_502"),
+        (ProviderStatusError(503), "model:http_503"),
+    ],
+)
+def test_transient_model_failures_retry_by_status_code(error, expected_code):
+    llm = FlakyLLM([error, AIMessage(content="recovered")])
+    graph = ShoppingGuideGraph(
+        llm=llm,
+        tools=[],
+        product_retriever=FakeRetriever(),
+        profile_store=FakeProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+    )
+    graph._wait_for_retry = lambda _delay: None
+    telemetry = graph._create_telemetry()
+
+    with run_context(telemetry):
+        response = graph._invoke_with_retry([HumanMessage(content="test")])
+
+    assert response.content == "recovered"
+    assert llm.calls == 2
+    assert telemetry.llm_calls == 2
+    assert telemetry.llm_retries == 1
+    assert telemetry.failure_counts == {expected_code: 1}
+    graph.close()
+
+
+@pytest.mark.parametrize(
+    ("max_llm_calls", "max_total_tokens", "usage", "stop_reason"),
+    [
+        (1, 1000, None, "llm_call_budget"),
+        (
+            5,
+            10,
+            {"input_tokens": 8, "output_tokens": 4, "total_tokens": 12},
+            "token_budget",
+        ),
+    ],
+)
+def test_llm_budgets_prevent_requested_tools_from_executing(
+    max_llm_calls, max_total_tokens, usage, stop_reason
+):
+    response = _make_tool_call_msg(tool_name="search")
+    if usage is not None:
+        response.usage_metadata = usage
+    llm = FakeToolLLM([response])
+    graph = ShoppingGuideGraph(
+        llm=llm,
+        tools=[],
+        product_retriever=FakeRetriever(),
+        profile_store=FakeProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+        max_llm_calls=max_llm_calls,
+        max_total_tokens=max_total_tokens,
+    )
+
+    result = graph.run("推荐一台笔记本", "budget-conv")
+
+    assert result["stop_reason"] == stop_reason
+    assert result["budget_stop"] == stop_reason
+    assert result["tool_rounds"] == 0
+    assert result["requested_tools"] == ["search"]
+    assert result["executed_tools"] == []
+    assert result["messages"][-1].tool_calls == []
+    graph.close()
+
+
+def test_pre_cancelled_run_does_not_call_model():
+    graph, llm = _lifecycle_graph([AIMessage(content="must not run")])
+    cancellation_event = threading.Event()
+    cancellation_event.set()
+
+    with pytest.raises(RunCancelledError):
+        graph.run(
+            "推荐一台笔记本",
+            "cancelled-conv",
+            cancellation_event=cancellation_event,
+        )
+
+    assert llm.calls == 0
+    graph.close()
+
+
+def test_run_time_budget_stops_after_in_flight_model_call_returns():
+    class SlowLLM(FakeToolLLM):
+        def invoke(self, messages):
+            time.sleep(0.03)
+            return super().invoke(messages)
+
+    llm = SlowLLM([AIMessage(content="late")])
+    graph = ShoppingGuideGraph(
+        llm=llm,
+        tools=[],
+        product_retriever=FakeRetriever(),
+        profile_store=FakeProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+        max_run_seconds=0.005,
+    )
+
+    with pytest.raises(RunTimeBudgetExceeded):
+        graph.run("推荐一台笔记本", "deadline-conv")
+
+    assert llm.calls == 1
+    graph.close()
+
+
+def test_stream_cancellation_interrupts_retry_wait():
+    llm = FlakyLLM([TimeoutError("provider timeout")])
+    graph = ShoppingGuideGraph(
+        llm=llm,
+        tools=[],
+        product_retriever=FakeRetriever(),
+        profile_store=FakeProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+        max_run_seconds=2,
+    )
+    cancellation_event = threading.Event()
+
+    async def cancel_during_retry():
+        stream = graph.run_stream(
+            "推荐一台笔记本",
+            "cancel-stream",
+            cancellation_event=cancellation_event,
+        )
+        async def consume():
+            async for _ in stream:
+                pass
+
+        consumer = asyncio.create_task(consume())
+        for _ in range(50):
+            if llm.calls:
+                break
+            await asyncio.sleep(0.01)
+        consumer.cancel()
+        try:
+            await consumer
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0.05)
+
+    asyncio.run(cancel_during_retry())
+
+    assert cancellation_event.is_set()
+    assert llm.calls == 1
+    graph.close()
+
+
+def test_retrieval_failure_uses_safe_fallback_and_diagnostic_code():
+    class BrokenRetriever:
+        def retrieve(self, query, top_k=5, filters=None):
+            raise RuntimeError("private catalog path")
+
+    graph = ShoppingGuideGraph(
+        llm=FakeToolLLM([AIMessage(content="fallback answer")]),
+        tools=[],
+        product_retriever=BrokenRetriever(),
+        profile_store=FakeProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+    )
+
+    result = graph.run("推荐一台笔记本", "retrieval-failure")
+
+    assert result["product_context"] == "(产品检索暂时不可用)"
+    assert result["fallbacks"] == ["retrieval_unavailable"]
+    assert result["failure_counts"] == {"retrieval:RuntimeError": 1}
+    assert "private catalog path" not in repr(result["failure_counts"])
     graph.close()

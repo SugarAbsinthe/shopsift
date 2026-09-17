@@ -19,9 +19,14 @@ Why separate nodes instead of flattening everything into one:
 """
 
 import asyncio
+import contextvars
 import re
 import sqlite3
 import threading
+import time
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Annotated, TypedDict, Literal
 
@@ -37,10 +42,17 @@ from src.profile.models import make_source_message_id
 from backend.logging_config import (
     Timer,
     create_run_telemetry,
+    get_run_telemetry,
     hash_identifier,
     log,
+    mark_budget_stop,
+    mark_cancelled,
+    mark_checkpoint_restored,
     mark_retrieval,
+    mark_timeout,
     record_executed_tools,
+    record_failure,
+    record_fallback,
     record_llm_response,
     record_llm_retry,
     record_requested_tools,
@@ -77,6 +89,78 @@ _TOOL_DATA_SAFETY_INSTRUCTION = (
 )
 _PROFILE_DATA_START = "<UNTRUSTED_PROFILE_DATA>"
 _PROFILE_DATA_END = "</UNTRUSTED_PROFILE_DATA>"
+
+
+class RunCancelledError(RuntimeError):
+    """Raised cooperatively after the caller disconnects or cancels a request."""
+
+
+class RunTimeBudgetExceeded(TimeoutError):
+    """Raised when a graph run exceeds its configured wall-clock budget."""
+
+
+class RunLLMBudgetExceeded(RuntimeError):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class _RunControl:
+    cancellation_event: threading.Event
+    deadline: float
+
+
+_run_control_ctx: contextvars.ContextVar[_RunControl | None] = contextvars.ContextVar(
+    "shopsift_run_control", default=None
+)
+
+
+@contextmanager
+def _run_control(cancellation_event: threading.Event, max_run_seconds: float):
+    control = _RunControl(
+        cancellation_event=cancellation_event,
+        deadline=time.perf_counter() + max_run_seconds,
+    )
+    token = _run_control_ctx.set(control)
+    try:
+        yield control
+    finally:
+        _run_control_ctx.reset(token)
+
+
+def _observe_node(name: str):
+    """Emit bounded node timing and failure metadata around graph nodes."""
+    def decorate(func):
+        @wraps(func)
+        def wrapped(self, state):
+            self._ensure_run_active()
+            telemetry = get_run_telemetry()
+            failure_count = (
+                sum(telemetry.failure_counts.values()) if telemetry else 0
+            )
+            try:
+                with Timer("graph_node", node=name):
+                    result = func(self, state)
+                self._ensure_run_active()
+                return result
+            except (RunCancelledError, RunTimeBudgetExceeded, RunLLMBudgetExceeded):
+                raise
+            except Exception as exc:
+                current_count = (
+                    sum(telemetry.failure_counts.values()) if telemetry else 0
+                )
+                if current_count == failure_count:
+                    category = {
+                        "retrieve": "retrieval",
+                        "agent": "model",
+                        "tools": "tool",
+                        "finalize": "model",
+                    }.get(name, "infrastructure")
+                    record_failure(category, type(exc).__name__)
+                raise
+        return wrapped
+    return decorate
 
 
 def format_untrusted_product_context(product_context: str, empty_text: str) -> str:
@@ -229,7 +313,18 @@ class ShoppingGuideGraph:
     def __init__(self, llm, tools: list, product_retriever, profile_store,
                  system_prompt: str, stage_classifier_prompt: str,
                  max_tool_rounds: int = 3, stage_prompts: dict = None,
-                 checkpoint_db_path: str = None):
+                 checkpoint_db_path: str = None,
+                 max_llm_calls: int = 6,
+                 max_total_tokens: int = 12_000,
+                 max_run_seconds: float = 55,
+                 provider: str = "unknown",
+                 model_name: str = "unknown",
+                 prompt_version: str = "unknown",
+                 pricing_version: str = "unconfigured",
+                 input_cost_per_million: float | None = None,
+                 output_cost_per_million: float | None = None):
+        if max_llm_calls < 1 or max_total_tokens < 1 or max_run_seconds <= 0:
+            raise ValueError("runtime budgets must be positive")
         self.llm = llm
         self.llm_with_tools = llm.bind_tools(tools)
         self.tools = tools
@@ -238,8 +333,19 @@ class ShoppingGuideGraph:
         self.system_prompt = system_prompt
         self.stage_classifier_prompt = stage_classifier_prompt
         self.max_tool_rounds = max_tool_rounds
+        self.max_llm_calls = max_llm_calls
+        self.max_total_tokens = max_total_tokens
+        self.max_run_seconds = max_run_seconds
         self.stage_prompts = stage_prompts or {}
         self.tool_gateway = ToolGateway(self.tools)
+        self.telemetry_metadata = {
+            "provider": provider,
+            "model": model_name,
+            "prompt_version": prompt_version,
+            "pricing_version": pricing_version,
+            "input_cost_per_million": input_cost_per_million,
+            "output_cost_per_million": output_cost_per_million,
+        }
 
         self._checkpoint_conn = None
         self.checkpointer = None
@@ -277,6 +383,108 @@ class ShoppingGuideGraph:
 
     # ---- Nodes ----
 
+    def _create_telemetry(self):
+        return create_run_telemetry(**self.telemetry_metadata)
+
+    @staticmethod
+    def _ensure_run_active() -> None:
+        control = _run_control_ctx.get()
+        if control is None:
+            return
+        if control.cancellation_event.is_set():
+            mark_cancelled()
+            log("run_cancelled")
+            raise RunCancelledError("run cancelled")
+        if time.perf_counter() >= control.deadline:
+            mark_timeout()
+            mark_budget_stop("time_budget")
+            log("run_timeout", reason="time_budget")
+            raise RunTimeBudgetExceeded("run time budget exceeded")
+
+    def _wait_for_retry(self, delay: float) -> None:
+        control = _run_control_ctx.get()
+        if control is None:
+            time.sleep(delay)
+            return
+        remaining = control.deadline - time.perf_counter()
+        if remaining <= 0:
+            self._ensure_run_active()
+        wait_for = min(delay, remaining)
+        if control.cancellation_event.wait(wait_for):
+            self._ensure_run_active()
+        if wait_for < delay:
+            self._ensure_run_active()
+
+    @staticmethod
+    def _is_retryable_llm_error(exc: Exception) -> bool:
+        status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+        if status in {429, 502, 503, 504}:
+            return True
+        error_code = str(getattr(exc, "code", "") or getattr(exc, "error_code", "")).lower()
+        if error_code in {"timeout", "timed_out", "rate_limit", "temporarily_unavailable"}:
+            return True
+        err_str = str(exc).lower()
+        return any(
+            keyword in err_str
+            for keyword in (
+                "timeout",
+                "timed out",
+                "rate limit",
+                "429",
+                "connection",
+                "reset",
+                "503",
+                "502",
+                "504",
+            )
+        )
+
+    @staticmethod
+    def _llm_error_code(exc: Exception) -> str:
+        status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+        if isinstance(status, int) and 100 <= status <= 599:
+            return f"http_{status}"
+        if isinstance(exc, TimeoutError):
+            return "timeout"
+        error_code = str(getattr(exc, "code", "") or getattr(exc, "error_code", "")).lower()
+        if error_code in {"timeout", "timed_out"}:
+            return "timeout"
+        if error_code in {"rate_limit", "rate_limited"}:
+            return "rate_limit"
+        if error_code == "temporarily_unavailable":
+            return "temporarily_unavailable"
+        err_str = str(exc).lower()
+        if "timeout" in err_str or "timed out" in err_str:
+            return "timeout"
+        if "rate limit" in err_str:
+            return "rate_limit"
+        if "connection" in err_str or "reset" in err_str:
+            return "connection_error"
+        return type(exc).__name__
+
+    def _llm_budget_reason(self) -> str | None:
+        telemetry = get_run_telemetry()
+        if not telemetry:
+            return None
+        if telemetry.llm_calls >= self.max_llm_calls:
+            return "llm_call_budget"
+        if (
+            telemetry.total_tokens is not None
+            and telemetry.total_tokens >= self.max_total_tokens
+        ):
+            return "token_budget"
+        return None
+
+    @staticmethod
+    def _budget_message(reason: str) -> AIMessage:
+        labels = {
+            "llm_call_budget": "模型调用次数",
+            "token_budget": "Token 使用量",
+        }
+        label = labels.get(reason, "运行")
+        return AIMessage(content=f"本轮已达到{label}上限，请缩小需求范围后继续。")
+
+    @_observe_node("analyze")
     def _analyze_node(self, state: ShoppingState) -> dict:
         conv_id = state["conv_id"]
         messages = state["messages"]
@@ -331,6 +539,7 @@ class ShoppingGuideGraph:
             "session_profile": session_profile,
         }
 
+    @_observe_node("retrieve")
     def _retrieve_node(self, state: ShoppingState) -> dict:
         stage = state.get("stage", "discovery")
         user_profile = state.get("user_profile", "")
@@ -381,12 +590,21 @@ class ShoppingGuideGraph:
                     "evidence": [item.model_dump() for item in retrieval_result.evidence],
                 }
             product_context = self.product_retriever.retrieve(augmented_query, **retrieve_kwargs)
-        except Exception:
+        except Exception as exc:
+            record_failure("retrieval", type(exc).__name__)
+            record_fallback("retrieval_unavailable")
+            log("retrieval_fallback", error_type=type(exc).__name__)
             product_context = "(产品检索暂时不可用)"
 
         return {"product_context": product_context, "retrieval_result": {}, "evidence": []}
 
-    def _invoke_with_retry(self, messages: list, max_retries: int = 3, model=None):
+    def _invoke_with_retry(
+        self,
+        messages,
+        max_retries: int = 3,
+        model=None,
+        operation: str = "agent",
+    ):
         """Invoke LLM with exponential backoff on transient failures.
 
         Only retries on infrastructure errors (timeout, rate limit, connection
@@ -394,40 +612,67 @@ class ShoppingGuideGraph:
         context too long) — those need code or prompt fixes, not retries.
         Delay: 1s → 2s → 4s (3 attempts max).
         """
-        import time as _time
         target_model = model or self.llm_with_tools
         last_exc = None
         for attempt in range(max_retries):
+            self._ensure_run_active()
+            budget_reason = self._llm_budget_reason()
+            if budget_reason:
+                mark_budget_stop(budget_reason)
+                raise RunLLMBudgetExceeded(budget_reason)
             try:
-                with Timer("llm_call", attempt=attempt + 1):
+                with Timer("llm_call", attempt=attempt + 1, operation=operation):
                     result = target_model.invoke(messages)
                 record_llm_response(result)
+                self._ensure_run_active()
                 return result
+            except (RunCancelledError, RunTimeBudgetExceeded, RunLLMBudgetExceeded):
+                raise
             except Exception as e:
                 last_exc = e
-                err_str = str(e).lower()
-                if not any(kw in err_str for kw in ("timeout", "rate limit", "429", "connection", "reset", "503", "502")):
+                error_code = self._llm_error_code(e)
+                if error_code in {"timeout", "http_504"}:
+                    mark_timeout("model", error_code)
+                else:
+                    record_failure("model", error_code)
+                if not self._is_retryable_llm_error(e):
                     raise
                 if attempt < max_retries - 1:
                     delay = 2 ** attempt  # 1s, 2s, 4s
                     record_llm_retry()
-                    log("llm_retry", attempt=attempt + 2, delay=delay)
-                    _time.sleep(delay)
-        log("llm_fail", attempts=max_retries, error_type=type(last_exc).__name__)
+                    log(
+                        "llm_retry",
+                        attempt=attempt + 2,
+                        delay=delay,
+                        error_type=type(e).__name__,
+                        error_code=error_code,
+                    )
+                    self._wait_for_retry(delay)
+        log(
+            "llm_fail",
+            attempts=max_retries,
+            error_type=type(last_exc).__name__,
+            error_code=self._llm_error_code(last_exc),
+        )
         raise last_exc
 
     @staticmethod
     def _verify_response(response: AIMessage, state: ShoppingState) -> tuple[AIMessage, dict, str | None]:
         """Verify only explicit catalog facts when structured retrieval exists."""
-        if getattr(response, "tool_calls", None):
-            result = VerificationResult(failure_codes=["tool_calls_pending"])
-            return response, result.model_dump(), None
-        result = verify_answer(response.content, state.get("retrieval_result"))
-        if result.status != "failed":
-            return response, result.model_dump(), None
-        safe_response = AIMessage(content="当前信息不足以确认产品或价格，请调整条件后重试。")
-        return safe_response, result.model_dump(), "verification_failed"
+        with Timer("graph_node", node="verifier"):
+            if getattr(response, "tool_calls", None):
+                result = VerificationResult(failure_codes=["tool_calls_pending"])
+                return response, result.model_dump(), None
+            result = verify_answer(response.content, state.get("retrieval_result"))
+            if result.status != "failed":
+                return response, result.model_dump(), None
+            for code in result.failure_codes:
+                record_failure("verification", code)
+            record_fallback("verification_safe_response")
+            safe_response = AIMessage(content="当前信息不足以确认产品或价格，请调整条件后重试。")
+            return safe_response, result.model_dump(), "verification_failed"
 
+    @_observe_node("agent")
     def _agent_node(self, state: ShoppingState) -> dict:
         stage = state.get("stage", "discovery")
         user_profile = state.get("user_profile", "(暂无画像)")
@@ -450,23 +695,46 @@ class ShoppingGuideGraph:
         # Prepare messages for LLM: system + conversation
         full_messages = [SystemMessage(content=system_text)] + list(state["messages"])
 
-        response = self._invoke_with_retry(full_messages)
+        budget_reason = self._llm_budget_reason()
+        if budget_reason:
+            mark_budget_stop(budget_reason)
+            return {
+                "messages": [self._budget_message(budget_reason)],
+                "agent_rounds": agent_rounds,
+                "verification": VerificationResult().model_dump(),
+                "stop_reason": budget_reason,
+            }
+        try:
+            response = self._invoke_with_retry(full_messages, operation="agent")
+        except RunLLMBudgetExceeded as exc:
+            return {
+                "messages": [self._budget_message(exc.reason)],
+                "agent_rounds": agent_rounds,
+                "verification": VerificationResult().model_dump(),
+                "stop_reason": exc.reason,
+            }
         response, verification, verification_stop = self._verify_response(response, state)
         record_requested_tools(
             call.get("name", "") for call in (response.tool_calls or [])
         )
+        budget_reason = self._llm_budget_reason()
+        if budget_reason:
+            mark_budget_stop(budget_reason)
+            if response.tool_calls:
+                response = self._budget_message(budget_reason)
 
         return {
             "messages": [response],
             "agent_rounds": agent_rounds + 1,
             "verification": verification,
             "stop_reason": (
-                verification_stop or
-                (state.get("stop_reason") or "completed")
-                if not response.tool_calls else ""
+                budget_reason
+                or verification_stop
+                or ((state.get("stop_reason") or "completed") if not response.tool_calls else "")
             ),
         }
 
+    @_observe_node("tools")
     def _tools_node(self, state: ShoppingState) -> dict:
         """Execute requested tools and count actual tool-node rounds."""
         try:
@@ -477,6 +745,13 @@ class ShoppingGuideGraph:
                 and getattr(message, "status", "success") == "error"
                 for message in tool_messages
             )
+            for message in tool_messages:
+                if getattr(message, "status", "success") == "error":
+                    gateway = getattr(message, "response_metadata", {}).get(
+                        "tool_gateway", {}
+                    )
+                    if not gateway.get("executed", False):
+                        record_failure("tool", gateway.get("code", "policy_denied"))
             record_executed_tools(
                 [
                     (getattr(message, "name", "") or "tool")
@@ -494,6 +769,9 @@ class ShoppingGuideGraph:
                 "stop_reason": "tool_error" if has_error else "",
             }
         except Exception as exc:
+            record_failure("tool", type(exc).__name__)
+            record_fallback("tool_error_answer")
+            log("tool_fallback", error_type=type(exc).__name__)
             last = state.get("messages", [])[-1] if state.get("messages") else None
             tool_messages = []
             for call in getattr(last, "tool_calls", []) or []:
@@ -513,6 +791,7 @@ class ShoppingGuideGraph:
                 "stop_reason": "tool_error",
             }
 
+    @_observe_node("finalize")
     def _finalize_node(self, state: ShoppingState) -> dict:
         """Produce a user-facing answer after a forced loop termination."""
         stage = state.get("stage", "discovery")
@@ -547,7 +826,28 @@ class ShoppingGuideGraph:
             *conversation,
             *skipped_tool_messages,
         ]
-        response = self._invoke_with_retry(full_messages, model=self.llm)
+        budget_reason = self._llm_budget_reason()
+        if budget_reason:
+            mark_budget_stop(budget_reason)
+            return {
+                "messages": [*skipped_tool_messages, self._budget_message(budget_reason)],
+                "agent_rounds": state.get("agent_rounds", 0),
+                "verification": VerificationResult().model_dump(),
+                "stop_reason": budget_reason,
+            }
+        try:
+            response = self._invoke_with_retry(
+                full_messages,
+                model=self.llm,
+                operation="finalize",
+            )
+        except RunLLMBudgetExceeded as exc:
+            return {
+                "messages": [*skipped_tool_messages, self._budget_message(exc.reason)],
+                "agent_rounds": state.get("agent_rounds", 0),
+                "verification": VerificationResult().model_dump(),
+                "stop_reason": exc.reason,
+            }
         if not getattr(response, "content", ""):
             response = AIMessage(content="已达到工具调用上限，现有信息不足以形成可靠结论，请补充需求后重试。")
         response, verification, verification_stop = self._verify_response(response, state)
@@ -582,7 +882,18 @@ class ShoppingGuideGraph:
 
     def _classify_stage(self, user_message: str, current_stage: str) -> str:
         """Classify the conversation stage via lightweight LLM call."""
-        return classify_stage(user_message, current_stage, self.llm, self.stage_classifier_prompt)
+        return classify_stage(
+            user_message,
+            current_stage,
+            self.llm,
+            self.stage_classifier_prompt,
+            invoke_llm=lambda prompt: self._invoke_with_retry(
+                prompt,
+                max_retries=1,
+                model=self.llm,
+                operation="stage_classifier",
+            ),
+        )
 
     def _extract_profile_signals(self, conv_id: str, user_message: str) -> dict:
         """Lightweight profile signal extraction from user message."""
@@ -604,14 +915,21 @@ class ShoppingGuideGraph:
             },
         }
 
-    async def run_stream(self, user_message: str, conv_id: str,
-                         chat_history: list = None):
+    async def run_stream(
+        self,
+        user_message: str,
+        conv_id: str,
+        chat_history: list = None,
+        cancellation_event: threading.Event | None = None,
+    ):
         """Stream real model chunks plus graph lifecycle events as SSE."""
         import json as _json
-        telemetry = create_run_telemetry()
+        telemetry = self._create_telemetry()
         run_id = telemetry.run_id
         config = self._run_config(conv_id, telemetry)
         has_checkpoint = bool(self.checkpointer and self.checkpointer.get_tuple(config))
+        with run_context(telemetry):
+            mark_checkpoint_restored(has_checkpoint)
         initial_state = {
             "messages": ([HumanMessage(content=user_message)] if has_checkpoint else
                          (chat_history or []) + [HumanMessage(content=user_message)]),
@@ -632,7 +950,7 @@ class ShoppingGuideGraph:
 
         queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
-        cancelled = threading.Event()
+        cancelled = cancellation_event or threading.Event()
 
         def _push(item):
             if not loop.is_closed():
@@ -642,15 +960,17 @@ class ShoppingGuideGraph:
             stream = None
             latest_state = dict(initial_state)
             try:
-                with run_context(telemetry):
+                with run_context(telemetry), _run_control(
+                    cancelled, self.max_run_seconds
+                ):
+                    self._ensure_run_active()
                     stream = self.graph.stream(
                         initial_state,
                         config=config,
                         stream_mode=["updates", "messages"],
                     )
                     for mode, payload in stream:
-                        if cancelled.is_set():
-                            break
+                        self._ensure_run_active()
                         if mode == "updates":
                             for node_output in payload.values():
                                 if node_output:
@@ -659,19 +979,23 @@ class ShoppingGuideGraph:
                                         if key != "messages"
                                     })
                         _push(("chunk", mode, payload))
-                    if not cancelled.is_set():
-                        final_state = (
-                            dict(self.graph.get_state(config).values)
-                            if self.checkpointer else latest_state
-                        )
-                        log(
-                            "run_end",
-                            stage=final_state.get("stage", "discovery"),
-                            tool_rounds=final_state.get("tool_rounds", 0),
-                            stop_reason=final_state.get("stop_reason", "completed"),
-                            **telemetry.snapshot(),
-                        )
-                        _push(("done", final_state))
+                    self._ensure_run_active()
+                    final_state = (
+                        dict(self.graph.get_state(config).values)
+                        if self.checkpointer else latest_state
+                    )
+                    log(
+                        "run_end",
+                        stage=final_state.get("stage", "discovery"),
+                        tool_rounds=final_state.get("tool_rounds", 0),
+                        stop_reason=final_state.get("stop_reason", "completed"),
+                        **telemetry.snapshot(),
+                    )
+                    _push(("done", final_state))
+            except RunCancelledError:
+                _push(("cancelled",))
+            except RunTimeBudgetExceeded:
+                _push(("timeout",))
             except Exception as exc:
                 with run_context(telemetry):
                     log("stream_worker_error", error_type=type(exc).__name__)
@@ -685,14 +1009,25 @@ class ShoppingGuideGraph:
         try:
             while True:
                 try:
-                    item = await asyncio.wait_for(queue.get(), timeout=60)
+                    item = await asyncio.wait_for(
+                        queue.get(), timeout=self.max_run_seconds + 1
+                    )
                 except asyncio.TimeoutError:
+                    cancelled.set()
                     yield _emit("error", {
                         "run_id": run_id,
                         "message": "Agent 响应超时，请稍后重试",
                     })
                     break
                 kind = item[0]
+                if kind == "cancelled":
+                    break
+                if kind == "timeout":
+                    yield _emit("error", {
+                        "run_id": run_id,
+                        "message": "Agent 响应超时，请稍后重试",
+                    })
+                    break
                 if kind == "error":
                     yield _emit("error", {
                         "run_id": run_id,
@@ -750,9 +1085,16 @@ class ShoppingGuideGraph:
             cancelled.set()
             if not worker_task.done():
                 worker_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker_task
 
-    def run(self, user_message: str, conv_id: str,
-            chat_history: list = None) -> dict:
+    def run(
+        self,
+        user_message: str,
+        conv_id: str,
+        chat_history: list = None,
+        cancellation_event: threading.Event | None = None,
+    ) -> dict:
         """Run the graph for one conversation turn.
 
         Args:
@@ -763,7 +1105,7 @@ class ShoppingGuideGraph:
         Returns:
             dict with keys: messages, stage, product_context, user_profile, tool_rounds
         """
-        telemetry = create_run_telemetry()
+        telemetry = self._create_telemetry()
         config = self._run_config(conv_id, telemetry)
         has_checkpoint = bool(self.checkpointer and self.checkpointer.get_tuple(config))
         initial_state = {
@@ -781,7 +1123,12 @@ class ShoppingGuideGraph:
         if not has_checkpoint:
             initial_state["stage"] = "discovery"
 
-        with run_context(telemetry):
+        cancellation_event = cancellation_event or threading.Event()
+        with run_context(telemetry), _run_control(
+            cancellation_event, self.max_run_seconds
+        ):
+            mark_checkpoint_restored(has_checkpoint)
+            self._ensure_run_active()
             try:
                 result = self.graph.invoke(initial_state, config=config)
             except Exception as exc:
@@ -961,8 +1308,13 @@ def parse_budget_expression(message: str) -> str | None:
     return None
 
 
-def classify_stage(user_message: str, current_stage: str, llm=None,
-                   stage_classifier_prompt: str = "") -> str:
+def classify_stage(
+    user_message: str,
+    current_stage: str,
+    llm=None,
+    stage_classifier_prompt: str = "",
+    invoke_llm=None,
+) -> str:
     """Classify the conversation stage.
 
     Rule-first strategy: regex keywords cover ~70% of real-world inputs
@@ -1011,14 +1363,24 @@ def classify_stage(user_message: str, current_stage: str, llm=None,
                 current_stage=current_stage,
                 user_message=user_message,
             )
-            result = llm.invoke(prompt)
+            if invoke_llm is not None:
+                result = invoke_llm(prompt)
+            else:
+                with Timer("llm_call", attempt=1, operation="stage_classifier"):
+                    result = llm.invoke(prompt)
+                record_llm_response(result)
             stage = result.content.strip().lower()
             valid_stages = {"discovery", "needs_elicitation", "search", "comparison",
                             "objection_handling", "recommendation", "summary"}
             if stage in valid_stages:
                 return stage
-        except Exception:
-            pass
+        except (RunCancelledError, RunTimeBudgetExceeded, RunLLMBudgetExceeded):
+            raise
+        except Exception as exc:
+            if invoke_llm is None:
+                record_failure("model", type(exc).__name__)
+            record_fallback("stage_classifier_rules")
+            log("stage_classifier_fallback", error_type=type(exc).__name__)
 
     return current_stage or "discovery"
 

@@ -4,6 +4,7 @@ LangGraph pipeline (analyze → retrieve → agent ⇄ tools → finalize) with
 per-stage prompt injection, durable conversation state, and bounded tool loops.
 """
 
+import threading
 from typing import Optional
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from src.agent.shopping_prompts import (
     SEARCH_AGENT_PROMPT,
     COMPARE_AGENT_PROMPT,
     RECOMMEND_AGENT_PROMPT,
+    SHOPPING_PROMPT_VERSION,
 )
 from src.config import config
 
@@ -82,10 +84,24 @@ class ShoppingGuideAgent:
             max_tool_rounds=max_tool_rounds,
             stage_prompts=stage_prompts,
             checkpoint_db_path=checkpoint_db_path or config.AGENT_CHECKPOINT_DB_PATH,
+            max_llm_calls=config.MAX_LLM_CALLS,
+            max_total_tokens=config.MAX_TOTAL_TOKENS,
+            max_run_seconds=config.MAX_RUN_SECONDS,
+            provider=config.LLM_PROVIDER,
+            model_name=config.LLM_MODEL,
+            prompt_version=SHOPPING_PROMPT_VERSION,
+            pricing_version=config.MODEL_PRICING_VERSION,
+            input_cost_per_million=config.MODEL_INPUT_COST_PER_1M,
+            output_cost_per_million=config.MODEL_OUTPUT_COST_PER_1M,
         )
 
-    def run(self, question: str, conv_id: str = "default",
-            chat_history: list = None) -> dict:
+    def run(
+        self,
+        question: str,
+        conv_id: str = "default",
+        chat_history: list = None,
+        cancellation_event: threading.Event | None = None,
+    ) -> dict:
         """Run the shopping guide Agent for one conversation turn.
 
         Args:
@@ -101,6 +117,7 @@ class ShoppingGuideAgent:
             user_message=question,
             conv_id=conv_id,
             chat_history=chat_history,
+            cancellation_event=cancellation_event,
         )
 
         # Extract final AI response
@@ -134,13 +151,34 @@ class ShoppingGuideAgent:
             "executed_tools": result["executed_tools"],
             "tool_errors": result["tool_errors"],
             "retrieval_stats": result["retrieval_stats"],
+            "provider": result["provider"],
+            "model": result["model"],
+            "prompt_version": result["prompt_version"],
+            "pricing_version": result["pricing_version"],
+            "estimated_cost_usd": result["estimated_cost_usd"],
+            "node_latency_ms": result["node_latency_ms"],
+            "failure_counts": result["failure_counts"],
+            "fallbacks": result["fallbacks"],
+            "tool_policy": result["tool_policy"],
+            "timeouts": result["timeouts"],
+            "cancelled": result["cancelled"],
+            "budget_stop": result["budget_stop"],
+            "checkpoint_restored": result["checkpoint_restored"],
         }
 
-    async def run_stream(self, question: str, conv_id: str = "default",
-                         chat_history: list = None):
+    async def run_stream(
+        self,
+        question: str,
+        conv_id: str = "default",
+        chat_history: list = None,
+        cancellation_event: threading.Event | None = None,
+    ):
         """Async generator yielding SSE-formatted events for streaming chat."""
         async for event in self.graph.run_stream(
-            user_message=question, conv_id=conv_id, chat_history=chat_history,
+            user_message=question,
+            conv_id=conv_id,
+            chat_history=chat_history,
+            cancellation_event=cancellation_event,
         ):
             yield event
 

@@ -42,6 +42,19 @@ class FakeAgent:
             "executed_tools": ["search_products"],
             "tool_errors": 0,
             "retrieval_stats": {"returned_candidates": 3},
+            "provider": "compatible-provider",
+            "model": "test-model",
+            "prompt_version": "prompt-v1",
+            "pricing_version": "pricing-v1",
+            "estimated_cost_usd": 0.001,
+            "node_latency_ms": {"agent": 20},
+            "failure_counts": {},
+            "fallbacks": [],
+            "tool_policy": [],
+            "timeouts": 0,
+            "cancelled": False,
+            "budget_stop": None,
+            "checkpoint_restored": True,
         }
 
 
@@ -62,6 +75,12 @@ def test_chat_response_includes_execution_metadata(monkeypatch):
     assert response.total_tokens == 20
     assert response.executed_tools == ["search_products"]
     assert response.retrieval_stats == {"returned_candidates": 3}
+    assert response.provider == "compatible-provider"
+    assert response.model == "test-model"
+    assert response.prompt_version == "prompt-v1"
+    assert response.estimated_cost_usd == 0.001
+    assert response.node_latency_ms == {"agent": 20}
+    assert response.checkpoint_restored is True
 
 
 def test_chat_error_does_not_expose_internal_exception(monkeypatch):
@@ -74,6 +93,31 @@ def test_chat_error_does_not_expose_internal_exception(monkeypatch):
         )))
     assert exc_info.value.detail == "Agent execution failed"
     assert "secret" not in exc_info.value.detail
+
+
+def test_chat_timeout_sets_cooperative_cancellation(monkeypatch):
+    class BlockingAgent:
+        def __init__(self):
+            self.cancellation_event = None
+
+        def run(self, **kwargs):
+            self.cancellation_event = kwargs["cancellation_event"]
+            self.cancellation_event.wait(1)
+            return {}
+
+    agent = BlockingAgent()
+    monkeypatch.setattr(chat_router, "get_agent", lambda: agent)
+    monkeypatch.setattr(chat_router, "_AGENT_TIMEOUT", 0.01)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(chat_router.chat(ChatRequest(
+            conv_id="conv-timeout", question="hello", chat_history=[]
+        )))
+
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.detail == "Agent response timed out, please try again"
+    assert agent.cancellation_event is not None
+    assert agent.cancellation_event.is_set()
 
 
 def test_stream_keeps_request_context_after_response_creation(monkeypatch):

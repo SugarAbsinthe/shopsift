@@ -44,6 +44,12 @@ logger.propagate = False
 class RunTelemetry:
     run_id: str
     request_id: str = ""
+    provider: str = "unknown"
+    model: str = "unknown"
+    prompt_version: str = "unknown"
+    pricing_version: str = "unconfigured"
+    input_cost_per_million: Optional[float] = None
+    output_cost_per_million: Optional[float] = None
     started_at: float = field(default_factory=time.perf_counter)
     llm_calls: int = 0
     llm_latency_ms: int = 0
@@ -57,11 +63,38 @@ class RunTelemetry:
     executed_tools: list[str] = field(default_factory=list)
     tool_errors: int = 0
     retrieval_stats: dict[str, Any] = field(default_factory=dict)
+    node_latency_ms: dict[str, int] = field(default_factory=dict)
+    failure_counts: dict[str, int] = field(default_factory=dict)
+    fallbacks: list[str] = field(default_factory=list)
+    tool_policy: list[dict[str, str]] = field(default_factory=list)
+    timeouts: int = 0
+    cancelled: bool = False
+    budget_stop: Optional[str] = None
+    checkpoint_restored: bool = False
+
+    def estimated_cost_usd(self) -> Optional[float]:
+        if (
+            self.input_cost_per_million is None
+            or self.output_cost_per_million is None
+            or self.input_tokens is None
+            or self.output_tokens is None
+        ):
+            return None
+        cost = (
+            self.input_tokens * self.input_cost_per_million
+            + self.output_tokens * self.output_cost_per_million
+        ) / 1_000_000
+        return round(cost, 8)
 
     def snapshot(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "request_id": self.request_id,
+            "provider": self.provider,
+            "model": self.model,
+            "prompt_version": self.prompt_version,
+            "pricing_version": self.pricing_version,
+            "estimated_cost_usd": self.estimated_cost_usd(),
             "latency_ms": round((time.perf_counter() - self.started_at) * 1000),
             "llm_calls": self.llm_calls,
             "llm_latency_ms": self.llm_latency_ms,
@@ -75,6 +108,14 @@ class RunTelemetry:
             "executed_tools": list(self.executed_tools),
             "tool_errors": self.tool_errors,
             "retrieval_stats": dict(self.retrieval_stats),
+            "node_latency_ms": dict(self.node_latency_ms),
+            "failure_counts": dict(self.failure_counts),
+            "fallbacks": list(self.fallbacks),
+            "tool_policy": [dict(item) for item in self.tool_policy],
+            "timeouts": self.timeouts,
+            "cancelled": self.cancelled,
+            "budget_stop": self.budget_stop,
+            "checkpoint_restored": self.checkpoint_restored,
         }
 
 
@@ -97,10 +138,25 @@ def hash_identifier(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
-def create_run_telemetry(run_id: str = "") -> RunTelemetry:
+def create_run_telemetry(
+    run_id: str = "",
+    *,
+    provider: str = "unknown",
+    model: str = "unknown",
+    prompt_version: str = "unknown",
+    pricing_version: str = "unconfigured",
+    input_cost_per_million: Optional[float] = None,
+    output_cost_per_million: Optional[float] = None,
+) -> RunTelemetry:
     return RunTelemetry(
         run_id=run_id or uuid.uuid4().hex,
         request_id=get_request_id(),
+        provider=provider,
+        model=model,
+        prompt_version=prompt_version,
+        pricing_version=pricing_version,
+        input_cost_per_million=input_cost_per_million,
+        output_cost_per_million=output_cost_per_million,
     )
 
 
@@ -123,8 +179,72 @@ def record_llm_retry() -> None:
         telemetry.llm_retries += 1
 
 
+def record_failure(category: str, code: str) -> None:
+    """Record a bounded failure taxonomy without exception messages."""
+    telemetry = get_run_telemetry()
+    if not telemetry:
+        return
+    allowed_categories = {
+        "model", "tool", "retrieval", "verification", "infrastructure",
+        "cancellation", "budget",
+    }
+    normalized_category = category if category in allowed_categories else "infrastructure"
+    normalized_code = re.sub(r"[^A-Za-z0-9_.-]", "_", str(code))[:64] or "unknown"
+    key = f"{normalized_category}:{normalized_code}"
+    telemetry.failure_counts[key] = telemetry.failure_counts.get(key, 0) + 1
+
+
+def record_fallback(name: str) -> None:
+    telemetry = get_run_telemetry()
+    normalized = re.sub(r"[^A-Za-z0-9_.-]", "_", str(name))[:64]
+    if telemetry and normalized and normalized not in telemetry.fallbacks:
+        telemetry.fallbacks.append(normalized)
+
+
+def record_tool_policy(
+    *, tool: str, decision: str, reason: str, stage: str, access: str = ""
+) -> None:
+    telemetry = get_run_telemetry()
+    if not telemetry:
+        return
+    telemetry.tool_policy.append({
+        "tool": str(tool)[:64],
+        "decision": str(decision)[:32],
+        "reason": str(reason)[:64],
+        "stage": str(stage)[:32],
+        "access": str(access)[:32],
+    })
+
+
+def mark_timeout(category: str = "infrastructure", code: str = "timeout") -> None:
+    telemetry = get_run_telemetry()
+    if telemetry:
+        telemetry.timeouts += 1
+        record_failure(category, code)
+
+
+def mark_cancelled() -> None:
+    telemetry = get_run_telemetry()
+    if telemetry:
+        telemetry.cancelled = True
+        record_failure("cancellation", "client_or_request")
+
+
+def mark_budget_stop(reason: str) -> None:
+    telemetry = get_run_telemetry()
+    if telemetry:
+        telemetry.budget_stop = reason
+        record_failure("budget", reason)
+
+
+def mark_checkpoint_restored(restored: bool) -> None:
+    telemetry = get_run_telemetry()
+    if telemetry:
+        telemetry.checkpoint_restored = bool(restored)
+
+
 def _add_optional_count(current: Optional[int], value: Any) -> Optional[int]:
-    if not isinstance(value, int) or isinstance(value, bool):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         return current
     return (current or 0) + value
 
@@ -143,6 +263,16 @@ def record_llm_response(response: Any) -> None:
     input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
     output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
     total_tokens = usage.get("total_tokens")
+    if (
+        total_tokens is None
+        and isinstance(input_tokens, int)
+        and not isinstance(input_tokens, bool)
+        and input_tokens >= 0
+        and isinstance(output_tokens, int)
+        and not isinstance(output_tokens, bool)
+        and output_tokens >= 0
+    ):
+        total_tokens = input_tokens + output_tokens
     telemetry.input_tokens = _add_optional_count(telemetry.input_tokens, input_tokens)
     telemetry.output_tokens = _add_optional_count(telemetry.output_tokens, output_tokens)
     telemetry.total_tokens = _add_optional_count(telemetry.total_tokens, total_tokens)
@@ -254,4 +384,15 @@ class Timer:
         if telemetry and self.event == "llm_call":
             telemetry.llm_calls += 1
             telemetry.llm_latency_ms += duration_ms
-        log(self.event, duration_ms=duration_ms, **self.kwargs)
+        if telemetry and self.event == "graph_node":
+            node = str(self.kwargs.get("node", "unknown"))[:64]
+            telemetry.node_latency_ms[node] = (
+                telemetry.node_latency_ms.get(node, 0) + duration_ms
+            )
+        fields = dict(self.kwargs)
+        if args and args[0] is not None:
+            fields["status"] = "error"
+            fields["error_type"] = args[0].__name__
+        else:
+            fields["status"] = "success"
+        log(self.event, duration_ms=duration_ms, **fields)

@@ -15,7 +15,7 @@ from typing import Any, Iterable, Mapping
 
 from langchain_core.messages import ToolMessage
 
-from backend.logging_config import log
+from backend.logging_config import log, mark_timeout, record_failure, record_tool_policy
 from src.profile.models import PROFILE_KEYS
 
 
@@ -145,6 +145,13 @@ class ToolGateway:
         self.registry = dict(build_tool_registry(tools) if registry is None else registry)
 
     def _audit(self, *, tool: str, decision: str, reason: str, stage: str, access: str = "") -> None:
+        record_tool_policy(
+            tool=tool,
+            decision=decision,
+            reason=reason,
+            stage=stage,
+            access=access,
+        )
         log("tool_policy", tool=tool, decision=decision, reason=reason, stage=stage, access=access)
 
     @staticmethod
@@ -290,11 +297,13 @@ class ToolGateway:
             self._audit(tool=name, decision="allow", reason="policy_pass", stage=stage, access=spec.access)
             result, error = self._invoke_with_timeout(tool, args, spec.timeout_ms)
             if error == "timeout":
+                mark_timeout("tool", "timeout")
                 self._audit(tool=name, decision="timeout", reason="timeout", stage=stage, access=spec.access)
                 message = self._error(call_id, name, "timeout")
                 message.response_metadata["tool_gateway"]["executed"] = True
                 messages.append(message)
             elif error:
+                record_failure("tool", error)
                 self._audit(tool=name, decision="error", reason="tool_error", stage=stage, access=spec.access)
                 message = self._error(call_id, name, "tool_error")
                 message.response_metadata["tool_gateway"]["executed"] = True

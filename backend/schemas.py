@@ -47,6 +47,19 @@ class ChatResponse(BaseModel):
     executed_tools: list[str]
     tool_errors: int
     retrieval_stats: dict = Field(default_factory=dict)
+    provider: str = "unknown"
+    model: str = "unknown"
+    prompt_version: str = "unknown"
+    pricing_version: str = "unconfigured"
+    estimated_cost_usd: Optional[float] = None
+    node_latency_ms: dict[str, int] = Field(default_factory=dict)
+    failure_counts: dict[str, int] = Field(default_factory=dict)
+    fallbacks: list[str] = Field(default_factory=list)
+    tool_policy: list[dict[str, str]] = Field(default_factory=list)
+    timeouts: int = 0
+    cancelled: bool = False
+    budget_stop: Optional[str] = None
+    checkpoint_restored: bool = False
 
 
 # ---- Conversations ----

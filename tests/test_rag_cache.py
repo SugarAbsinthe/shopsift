@@ -28,3 +28,20 @@ def test_legacy_get_set_signatures_remain_valid():
     cache = _cache_without_redis()
     assert cache.get("laptop", 5) is None
     cache.set("laptop", 5, "result")
+
+
+def test_cache_miss_or_backend_failure_falls_through():
+    class MissingRedis:
+        def get(self, key):
+            return None
+
+    class BrokenRedis:
+        def get(self, key):
+            raise TimeoutError("redis unavailable")
+
+    cache = _cache_without_redis()
+    cache._redis = MissingRedis()
+    assert cache.get("laptop", 5) is None
+
+    cache._redis = BrokenRedis()
+    assert cache.get("laptop", 5) is None

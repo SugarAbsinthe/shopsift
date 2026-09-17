@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json as _json
+import threading
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -20,6 +21,7 @@ from backend.logging_config import (
     set_request_id,
     Timer,
 )
+from src.config import config
 
 router = APIRouter(tags=["chat"])
 
@@ -41,7 +43,7 @@ def _format_sse(event: str, data: dict | str) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
-_AGENT_TIMEOUT = 60  # seconds
+_AGENT_TIMEOUT = config.AGENT_REQUEST_TIMEOUT_SECONDS
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -57,6 +59,7 @@ async def chat(request: ChatRequest):
         msg_len=len(request.question),
     )
     history = _build_chat_history(request.chat_history)
+    cancellation_event = threading.Event()
 
     try:
         with Timer("agent_run"):
@@ -69,6 +72,7 @@ async def chat(request: ChatRequest):
                         question=request.question,
                         conv_id=request.conv_id,
                         chat_history=history,
+                        cancellation_event=cancellation_event,
                     )
                 ),
                 timeout=_AGENT_TIMEOUT,
@@ -91,6 +95,8 @@ async def chat(request: ChatRequest):
     except Exception as e:
         log("request_error", error_type=type(e).__name__)
         raise HTTPException(status_code=500, detail="Agent execution failed")
+    finally:
+        cancellation_event.set()
 
     return ChatResponse(
         answer=result.get("answer", ""),
@@ -115,6 +121,19 @@ async def chat(request: ChatRequest):
         executed_tools=result.get("executed_tools", []),
         tool_errors=result.get("tool_errors", 0),
         retrieval_stats=result.get("retrieval_stats", {}),
+        provider=result.get("provider", "unknown"),
+        model=result.get("model", "unknown"),
+        prompt_version=result.get("prompt_version", "unknown"),
+        pricing_version=result.get("pricing_version", "unconfigured"),
+        estimated_cost_usd=result.get("estimated_cost_usd"),
+        node_latency_ms=result.get("node_latency_ms", {}),
+        failure_counts=result.get("failure_counts", {}),
+        fallbacks=result.get("fallbacks", []),
+        tool_policy=result.get("tool_policy", []),
+        timeouts=result.get("timeouts", 0),
+        cancelled=result.get("cancelled", False),
+        budget_stop=result.get("budget_stop"),
+        checkpoint_restored=result.get("checkpoint_restored", False),
     )
 
 
@@ -131,6 +150,7 @@ async def chat_stream(request: ChatRequest):
         msg_len=len(request.question),
     )
     history = _build_chat_history(request.chat_history)
+    cancellation_event = threading.Event()
     stream_request_id = get_request_id()
 
     async def _event_generator():
@@ -140,6 +160,7 @@ async def chat_stream(request: ChatRequest):
                 question=request.question,
                 conv_id=request.conv_id,
                 chat_history=history,
+                cancellation_event=cancellation_event,
             ):
                 yield sse_msg
             log("stream_end")
@@ -147,6 +168,7 @@ async def chat_stream(request: ChatRequest):
             log("stream_error", error_type=type(exc).__name__)
             yield _format_sse("error", {"message": "Agent execution failed"})
         finally:
+            cancellation_event.set()
             reset_request_id(request_token)
 
     return StreamingResponse(
