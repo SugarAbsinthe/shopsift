@@ -1,6 +1,7 @@
 # ShopSift
 
 ShopSift 是基于 LangGraph 的智能购物助手。用户用自然语言描述需求，ShopSift 自动挖掘偏好、检索产品、对比推荐，并在同一会话中持久化图状态与用户画像。
+注：真实商品数据信息等需要自行维护，或采用模拟数据来观测(后续会补充以方便使用)
 
 ```
  React 前端 ──真实 Token SSE──→ FastAPI ──→ Agent (单例)
