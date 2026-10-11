@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml .
 COPY src/ ./src/
 COPY backend/ ./backend/
-RUN pip install --no-cache-dir -e . && pip install --no-cache-dir fastapi uvicorn
+RUN pip install --no-cache-dir -e .
 
 EXPOSE 8000
 

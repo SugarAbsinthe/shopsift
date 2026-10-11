@@ -189,6 +189,10 @@ def ensure_hf_offline_if_needed() -> bool:
 
     if os.environ.get("HF_HUB_OFFLINE") == "1":
         return True
+    # An explicit online setting must also win over the cache heuristic:
+    # the cache directory can contain another model or an incomplete download.
+    if os.environ.get("HF_HUB_OFFLINE") == "0":
+        return False
 
     # Check if the embedding model is already cached locally
     from pathlib import Path

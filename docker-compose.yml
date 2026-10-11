@@ -1,32 +1,46 @@
+x-backend: &backend-common
+  image: shopsift-backend:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - .env
+  environment:
+    HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+    TRANSFORMERS_OFFLINE: ${HF_HUB_OFFLINE:-0}
+    REDIS_URL: redis://redis:6379/0
+    REDIS_ENABLED: ${REDIS_ENABLED:-false}
+  volumes:
+    - ./data:/app/data
+    - huggingface_cache:/root/.cache/huggingface
+
 services:
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       retries: 3
 
+  init:
+    <<: *backend-common
+    command: ["python", "-m", "backend.bootstrap"]
+    restart: "no"
+
   backend:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *backend-common
     ports:
-      - "8000:8000"
-    environment:
-      - HF_HUB_OFFLINE=1
-      - REDIS_URL=redis://redis:6379/0
-      - REDIS_ENABLED=true
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-placeholder}
-      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
-      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
-    volumes:
-      - ./data:/app/data
-      - huggingface_cache:/root/.cache/huggingface
+      - "127.0.0.1:8000:8000"
     depends_on:
+      init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/docs', timeout=3).close()"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
     restart: unless-stopped
 
   frontend:
@@ -34,9 +48,12 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "5173:5173"
+      - "127.0.0.1:5173:5173"
+    environment:
+      API_PROXY_TARGET: http://backend:8000
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
