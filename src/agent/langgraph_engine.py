@@ -974,6 +974,10 @@ class ShoppingGuideGraph:
                         if mode == "updates":
                             for node_output in payload.values():
                                 if node_output:
+                                    if "messages" in node_output:
+                                        latest_state["messages"] = add_messages(
+                                            latest_state["messages"], node_output["messages"]
+                                        )
                                     latest_state.update({
                                         key: value for key, value in node_output.items()
                                         if key != "messages"
@@ -1006,6 +1010,8 @@ class ShoppingGuideGraph:
                     close()
 
         worker_task = asyncio.create_task(asyncio.to_thread(_worker))
+        buffer_answer = False
+        pending_tokens: list[str] = []
         try:
             while True:
                 try:
@@ -1036,7 +1042,10 @@ class ShoppingGuideGraph:
                     break
                 if kind == "done":
                     result = item[1]
+                    messages = result.get("messages", [])
+                    answer = messages[-1].content if messages and isinstance(messages[-1], AIMessage) else ""
                     yield _emit("done", {
+                        "answer": answer,
                         "stage": result.get("stage", "discovery"),
                         "tool_rounds": result.get("tool_rounds", 0),
                         "agent_rounds": result.get("agent_rounds", 0),
@@ -1054,13 +1063,30 @@ class ShoppingGuideGraph:
                         continue
                     content = getattr(message, "content", "")
                     if isinstance(content, str) and content:
-                        yield _emit("token", {"content": content})
+                        if buffer_answer:
+                            pending_tokens.append(content)
+                        else:
+                            yield _emit("token", {"content": content})
                     continue
 
                 if mode != "updates":
                     continue
                 for node_name, node_output in payload.items():
                     node_output = node_output or {}
+                    if node_name == "retrieve":
+                        buffer_answer = bool(node_output.get("retrieval_result"))
+                    if buffer_answer and node_name in {"agent", "finalize"}:
+                        # Raw catalog claims must not escape before verification.
+                        # Discard tool-request preambles; emit only the accepted
+                        # response, preserving original chunks when unchanged.
+                        for response in node_output.get("messages", []):
+                            if isinstance(response, AIMessage) and not response.tool_calls:
+                                content = response.content
+                                chunks = pending_tokens if "".join(pending_tokens) == content else [content]
+                                for chunk in chunks:
+                                    if chunk:
+                                        yield _emit("token", {"content": chunk})
+                        pending_tokens = []
                     if node_name == "analyze":
                         yield _emit("stage", {"stage": node_output.get("stage", "discovery")})
                     elif node_name == "retrieve" and node_output.get("product_context"):
@@ -1251,15 +1277,39 @@ def parse_budget_expression(message: str) -> str | None:
     """
     import re
 
-    text = message.replace(",", "").replace("，", "")
+    # Remove thousands separators, but retain clause boundaries. A specification
+    # elsewhere in the sentence must not inherit the word "预算".
+    text = re.sub(r"(?<=\d)[,，](?=\d{3}(?:\D|$))", "", message)
     flags = re.IGNORECASE
+    price_token = rf"(?<![A-Za-z0-9.]){_PRICE_TOKEN_PATTERN}(?![A-Za-z0-9.])"
 
-    range_match = re.search(
-        rf"(?P<low>{_PRICE_TOKEN_PATTERN})\s*元?\s*(?:-|—|~|～|到|至)\s*"
-        rf"(?P<high>{_PRICE_TOKEN_PATTERN})\s*元?",
-        text,
-        flags,
-    )
+    def price_matches(pattern, *, budget_only=False):
+        for match in re.finditer(pattern, text, flags):
+            amount_end = match.end("high" if "high" in match.groupdict() else "amount")
+            if re.match(
+                r"\s*(?:[GMTP]B|[GM]Hz|英寸|寸|小时|公斤|克|瓦|核|帧|%)",
+                text[amount_end:], flags,
+            ):
+                continue
+            prefix = re.split(r"[,，。;；!?！？\n]", text[:match.start()])[-1]
+            budget_context = re.search(
+                r"预算\s*(?:是|为|在|大约|大概|约|上限|[:：])*\s*$", prefix,
+            )
+            if "预算" in text and not budget_context:
+                continue
+            if budget_only and not re.search(r"预算\s*[:：]?\s*$", prefix):
+                continue
+            monetary_context = re.search(
+                r"(?:预算|价位|价格|花费)\s*(?:是|为|在|大约|大概|约|上限|[:：])*\s*$",
+                prefix,
+            ) or re.search(r"(?:人民币|RMB|[¥￥])\s*$", prefix, flags)
+            if monetary_context or re.search(r"元|块", match.group()):
+                yield match
+
+    range_match = next(price_matches(
+        rf"(?P<low>{price_token})\s*元?\s*(?:-|—|~|～|到|至)\s*"
+        rf"(?P<high>{price_token})\s*(?:元|块)?",
+    ), None)
     if range_match:
         low = _parse_price_amount(range_match.group("low"))
         high = _parse_price_amount(range_match.group("high"))
@@ -1267,28 +1317,20 @@ def parse_budget_expression(message: str) -> str | None:
             return f"{low}-{high}"
         return None
 
-    upper_match = re.search(
-        rf"(?P<amount>{_PRICE_TOKEN_PATTERN})\s*元?\s*(?:以内|以下|之内)",
-        text,
-        flags,
-    ) or re.search(
-        rf"(?:不超过|最多|上限(?:是|为)?)\s*(?P<amount>{_PRICE_TOKEN_PATTERN})\s*元?",
-        text,
-        flags,
-    )
+    upper_match = next(price_matches(
+        rf"(?P<amount>{price_token})\s*(?:元|块)?\s*(?:以内|以下|之内)",
+    ), None) or next(price_matches(
+        rf"(?:不超过|最多|上限(?:是|为)?)\s*(?P<amount>{price_token})\s*(?:元|块)?",
+    ), None)
     if upper_match:
         amount = _parse_price_amount(upper_match.group("amount"))
         return f"<={amount}" if amount is not None else None
 
-    around_match = re.search(
-        rf"(?P<amount>{_PRICE_TOKEN_PATTERN})\s*元?\s*(?:左右|上下)",
-        text,
-        flags,
-    ) or re.search(
-        rf"(?:大约|大概|约)\s*(?P<amount>{_PRICE_TOKEN_PATTERN})\s*元?",
-        text,
-        flags,
-    )
+    around_match = next(price_matches(
+        rf"(?P<amount>{price_token})\s*(?:元|块)?\s*(?:左右|上下)",
+    ), None) or next(price_matches(
+        rf"(?:大约|大概|约)\s*(?P<amount>{price_token})\s*(?:元|块)?",
+    ), None)
     if around_match:
         amount = _parse_price_amount(around_match.group("amount"))
         if amount is None:
@@ -1297,11 +1339,10 @@ def parse_budget_expression(message: str) -> str | None:
         upper = int(round(amount * (1 + BUDGET_AROUND_TOLERANCE)))
         return f"{lower}-{upper}"
 
-    bare_match = re.search(
-        rf"预算\s*[:：]?\s*(?P<amount>{_PRICE_TOKEN_PATTERN})\s*元?",
-        text,
-        flags,
-    )
+    bare_match = next(price_matches(
+        rf"(?P<amount>{price_token})\s*(?:元|块)?",
+        budget_only=True,
+    ), None)
     if bare_match:
         amount = _parse_price_amount(bare_match.group("amount"))
         return f"<={amount}" if amount is not None else None
@@ -1394,6 +1435,20 @@ def extract_profile_signals(conv_id: str, user_message: str, profile_store) -> d
     )
     session_profile: dict = {}
 
+    def affirmative(keyword: str) -> bool:
+        # Be conservative about automatic memory writes. Negation is local to
+        # a clause; punctuation / contrast resets its scope. This is not a
+        # general language parser, so ambiguous clauses simply yield no signal.
+        for match in re.finditer(re.escape(keyword), message_lower):
+            prefix = re.split(r"[,，。;；!?！？\n]|但是|不过|而是|但", message_lower[:match.start()])[-1]
+            suffix = re.split(r"[,，。;；!?！？\n]|但是|不过|而是|但", message_lower[match.end():])[0]
+            if re.search(r"不|没|无需|无须|并非|别|排除|除了", prefix):
+                continue
+            if re.match(r"\s*(?:不|没|无需|无须|并非)", suffix):
+                continue
+            return True
+        return False
+
     def record(
         key: str,
         value: str,
@@ -1445,7 +1500,7 @@ def extract_profile_signals(conv_id: str, user_message: str, profile_store) -> d
         "watch": "智能手表",
     }
     for keyword, category in category_map.items():
-        if keyword in message_lower:
+        if affirmative(keyword):
             record(
                 "product_category",
                 category,
@@ -1474,7 +1529,7 @@ def extract_profile_signals(conv_id: str, user_message: str, profile_store) -> d
         "作业": "student",
     }
     explicit_use = next(
-        ((keyword, value) for keyword, value in explicit_use_map.items() if keyword in message_lower),
+        ((keyword, value) for keyword, value in explicit_use_map.items() if affirmative(keyword)),
         None,
     )
     if explicit_use:
@@ -1488,9 +1543,10 @@ def extract_profile_signals(conv_id: str, user_message: str, profile_store) -> d
         )
     else:
         inferred_use = None
-        if any(keyword in message_lower for keyword in ("出差", "通勤", "经常携带")):
-            inferred_use = ("出差" if "出差" in message_lower else "通勤", "office")
-        elif "游戏本" in message_lower:
+        travel = next((keyword for keyword in ("出差", "通勤", "经常携带") if affirmative(keyword)), None)
+        if travel:
+            inferred_use = (travel, "office")
+        elif affirmative("游戏本"):
             inferred_use = ("游戏本", "gaming")
         if inferred_use:
             keyword, value = inferred_use
@@ -1503,7 +1559,7 @@ def extract_profile_signals(conv_id: str, user_message: str, profile_store) -> d
             )
 
     mobility_keywords = ("携带", "通勤", "带去", "轻便", "轻薄", "经常带", "出差")
-    mobility_keyword = next((item for item in mobility_keywords if item in message), None)
+    mobility_keyword = next((item for item in mobility_keywords if affirmative(item)), None)
     if mobility_keyword:
         explicit_mobility = bool(
             re.search(r"(?:希望|需要|要求|偏好|想要).{0,12}(?:轻薄|轻便|方便携带)", message)
@@ -1535,7 +1591,7 @@ def extract_profile_signals(conv_id: str, user_message: str, profile_store) -> d
             rf"(?:喜欢|偏好|首选|只要|想买|倾向于|优先考虑)\s*{re.escape(brand)}",
             rf"{re.escape(brand)}\s*(?:优先|更合适)",
         )
-        if any(re.search(pattern, message, re.IGNORECASE) for pattern in preference_patterns):
+        if affirmative(brand) and any(re.search(pattern, message, re.IGNORECASE) for pattern in preference_patterns):
             record(
                 "preferred_brand",
                 brand,

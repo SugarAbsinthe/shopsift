@@ -197,6 +197,9 @@ class ShoppingGuideAgent:
 
     def close(self) -> None:
         self.graph.close()
+        close_retriever = getattr(self.product_retriever, "close", None)
+        if close_retriever:
+            close_retriever()
 
     def run_simple(self, question: str, conv_id: str = "default") -> dict:
         """Simplified single-shot mode: no LangGraph, one LLM call with tools.

@@ -124,6 +124,25 @@ class TestExtractProfileSignals:
     def test_reversed_budget_range_is_not_silently_reordered(self):
         assert parse_budget_expression("预算8000到5000") is None
 
+    @pytest.mark.parametrize(("message", "expected"), [
+        ("推荐16-32GB内存的笔记本", None),
+        ("预算8000元，内存16-32GB，推荐笔记本", "<=8000"),
+        ("内存16-32GB，预算8000元", "<=8000"),
+        ("预算8000元内存16-32GB", "<=8000"),
+        ("推荐14-16英寸，重量1.2公斤以内的笔记本", None),
+        ("需要32GB以内内存，预算6000左右", "5400-6600"),
+        ("屏幕大约14英寸", None),
+        ("预算6,000元", "<=6000"),
+        ("预算5000到6500元，内存16-32GB", "5000-6500"),
+        ("5000到6500元的笔记本", "5000-6500"),
+        ("预算32GB", None),
+        ("预算RTX4060", None),
+        ("这款售价7999元，内存16-32GB", None),
+        ("预算8000元，对比5000-6500元的笔记本", "<=8000"),
+    ])
+    def test_budget_requires_price_context_and_rejects_spec_units(self, message, expected):
+        assert parse_budget_expression(message) == expected
+
 
 def _make_graph(max_tool_rounds=3):
     """Minimal graph for testing routing logic."""

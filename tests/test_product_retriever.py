@@ -2,6 +2,8 @@
 
 import json
 import sqlite3
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 from src.retrieval.models import RetrievalQuery
 from src.retrieval.product_retriever import ProductRetriever, reciprocal_rank_fusion
@@ -156,3 +158,52 @@ def test_retrieve_keeps_string_api_and_empty_result_message(tmp_path):
     text = retriever.retrieve("游戏本", filters={"max_price": 100})
     assert isinstance(text, str)
     assert "未找到满足当前约束的商品" in text
+
+
+def test_shared_sparse_index_works_on_workers_and_concurrent_search(tmp_path):
+    retriever, _ = _retriever(tmp_path)
+    expected, fallback = retriever._sparse_recall("RTX 4060", 5)
+    assert expected and fallback is False
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _: retriever.search("RTX 4060", top_k=2), range(12)))
+        assert all(result.stats.sparse_fallback is False for result in results)
+        assert all(result.stats.source_hits["sparse"] == len(expected) for result in results)
+        assert all(result.products[0].product_id == 1 for result in results)
+    finally:
+        retriever.close()
+    assert retriever._sparse_recall("RTX", 5) == ([], True)
+    retriever.close()  # Shutdown is idempotent.
+
+
+def test_sparse_close_is_safe_during_worker_reads(tmp_path):
+    retriever, _ = _retriever(tmp_path)
+    expected = retriever._sparse_recall("RTX", 5)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(retriever._sparse_recall, "RTX", 5) for _ in range(20)]
+        pool.submit(retriever.close).result()
+        assert all(future.result() in (expected, ([], True)) for future in futures)
+
+
+def test_stream_graph_preserves_sparse_channel_on_its_worker(tmp_path):
+    from src.agent.langgraph_engine import ShoppingGuideGraph
+    from tests.test_graph import StreamingFakeLLM, FakeProfileStore
+    retriever, _ = _retriever(tmp_path)
+    graph = ShoppingGuideGraph(
+        llm=StreamingFakeLLM(chunks=["Product ID: 1, price: 7999 RMB"]),
+        tools=[], product_retriever=retriever, profile_store=FakeProfileStore(),
+        system_prompt="{product_context}", stage_classifier_prompt="",
+        checkpoint_db_path=str(tmp_path / "graph.db"),
+    )
+
+    async def collect():
+        return [event async for event in graph.run_stream("推荐 RTX 4060", "sparse-worker")]
+
+    try:
+        events = asyncio.run(collect())
+        done = json.loads(next(event for event in events if event.startswith("event: done")).split("data: ", 1)[1])
+        assert done["retrieval_stats"]["source_hits"]["sparse"] > 0
+        assert done["retrieval_stats"]["sparse_fallback"] is False
+    finally:
+        graph.close()
+        retriever.close()

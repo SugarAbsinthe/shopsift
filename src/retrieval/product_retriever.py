@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 import time
+from contextlib import closing
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
@@ -23,7 +25,7 @@ from src.retrieval.models import (
 from src.retrieval.index_manifest import resolve_collection_names
 
 
-RETRIEVAL_ALGORITHM_VERSION = "hybrid-rrf-v2-evidence"
+RETRIEVAL_ALGORITHM_VERSION = "hybrid-rrf-v3-threadsafe-sparse"
 RRF_K = 60
 
 
@@ -67,6 +69,7 @@ class ProductRetriever:
         self.catalog_db = catalog_db
         self._cache = cache
         self._sparse_conn: sqlite3.Connection | None = None
+        self._sparse_lock = threading.Lock()
         self._sparse_available = False
         self._initialize_sparse_index()
 
@@ -74,17 +77,19 @@ class ProductRetriever:
         """Build a process-local FTS index; never mutate the catalog database."""
         if not self.catalog_db or not Path(self.catalog_db).is_file():
             return
+        sparse = None
         try:
-            catalog = sqlite3.connect(
+            with closing(sqlite3.connect(
                 f"file:{Path(self.catalog_db).resolve()}?mode=ro", uri=True
-            )
-            catalog.row_factory = sqlite3.Row
-            rows = catalog.execute(
-                "SELECT product_id, name, brand, category, subcategory, "
-                "description, specs FROM products ORDER BY product_id"
-            ).fetchall()
-            catalog.close()
-            sparse = sqlite3.connect(":memory:")
+            )) as catalog:
+                catalog.row_factory = sqlite3.Row
+                rows = catalog.execute(
+                    "SELECT product_id, name, brand, category, subcategory, "
+                    "description, specs FROM products ORDER BY product_id"
+                ).fetchall()
+            # The API creates the retriever on one thread and runs the graph on
+            # workers. Serialize all access to the shared in-memory connection.
+            sparse = sqlite3.connect(":memory:", check_same_thread=False)
             sparse.execute(
                 "CREATE VIRTUAL TABLE product_fts USING fts5("
                 "product_id UNINDEXED, searchable, tokenize='trigram')"
@@ -105,9 +110,12 @@ class ProductRetriever:
                     for row in rows
                 ],
             )
+            sparse.commit()
             self._sparse_conn = sparse
             self._sparse_available = True
         except (OSError, sqlite3.Error):
+            if sparse is not None:
+                sparse.close()
             self._sparse_conn = None
             self._sparse_available = False
 
@@ -152,14 +160,25 @@ class ProductRetriever:
             f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms
         )
         try:
-            rows = self._sparse_conn.execute(
-                "SELECT product_id FROM product_fts WHERE searchable MATCH ? "
-                "ORDER BY bm25(product_fts) LIMIT ?",
-                (expression, limit),
-            ).fetchall()
+            with self._sparse_lock:
+                if self._sparse_conn is None:
+                    return [], True
+                rows = self._sparse_conn.execute(
+                    "SELECT product_id FROM product_fts WHERE searchable MATCH ? "
+                    "ORDER BY bm25(product_fts) LIMIT ?",
+                    (expression, limit),
+                ).fetchall()
             return [int(row[0]) for row in rows], False
         except sqlite3.Error:
             return [], True
+
+    def close(self) -> None:
+        """Release the FTS connection without racing an in-flight query."""
+        with self._sparse_lock:
+            if self._sparse_conn is not None:
+                self._sparse_conn.close()
+                self._sparse_conn = None
+            self._sparse_available = False
 
     def _load_catalog_products(self, product_ids: list[int]) -> dict[int, ProductCandidate]:
         if not product_ids or not self.catalog_db:

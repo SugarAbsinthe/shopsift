@@ -1,6 +1,7 @@
 """Deterministic lifecycle tests for governed structured profile memory."""
 
 import sqlite3
+import pytest
 from datetime import datetime, timedelta, timezone
 
 from src.agent.langgraph_engine import (
@@ -336,6 +337,36 @@ def test_inferred_travel_signals_remain_pending_and_outside_filters(tmp_path):
         ("mobility", "high", "inferred"),
     }
     assert build_retrieval_constraints(store.get_structured("conv-1")) == {}
+
+
+@pytest.mark.parametrize(("message", "expected"), [
+    ("不打游戏，主要办公，推荐一台笔记本", {"primary_use": "office", "product_category": "笔记本电脑"}),
+    ("不要手机，想买笔记本", {"product_category": "笔记本电脑"}),
+    ("手机不要，想买笔记本", {"product_category": "笔记本电脑"}),
+    ("不需要轻薄，主要在家用", {}),
+    ("不出差，也不通勤", {}),
+    ("不买游戏本", {}),
+    ("我需要轻薄笔记本，主要办公", {"mobility": "high", "product_category": "笔记本电脑", "primary_use": "office"}),
+    ("不想办公，但需要打游戏", {"primary_use": "gaming"}),
+    ("推荐无线耳机", {"product_category": "无线耳机"}),
+    ("我非常需要轻薄笔记本", {"mobility": "high", "product_category": "笔记本电脑"}),
+    ("不喜欢苹果", {}),
+])
+def test_negated_signals_are_not_written_as_positive_memories(tmp_path, message, expected):
+    store = _store(tmp_path)
+    extract_profile_signals("conv-1", message, store)
+    assert {key: item["value"] for key, item in store.get_structured("conv-1").items()} == expected
+    assert store.list_candidates("conv-1", statuses=("pending",)) == []
+
+
+def test_valid_new_budget_replaces_old_value_without_spec_range_pollution(tmp_path):
+    store = _store(tmp_path)
+    extract_profile_signals("conv-1", "预算6000元，想买笔记本", store)
+    extract_profile_signals("conv-1", "预算8000元，内存16-32GB", store)
+    assert build_retrieval_constraints(store.get_structured("conv-1")) == {
+        "max_price": 8000, "category": "笔记本电脑",
+    }
+    assert store.get_structured("another-conversation") == {}
 
 
 def test_turn_local_budget_affects_filters_without_being_persisted(tmp_path):

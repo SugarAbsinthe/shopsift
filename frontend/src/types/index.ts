@@ -36,6 +36,7 @@ export interface ChatResponse {
 }
 
 export interface StreamDoneMeta {
+  answer: string;
   run_id: string;
   stage: string;
   tool_rounds: number;
