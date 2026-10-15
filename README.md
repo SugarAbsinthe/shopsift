@@ -2,11 +2,11 @@
 
 **基于 LangGraph 的购物 Agent，结合会话画像、混合检索与受控工具调用。**
 
-以笔记本选购为主要场景：用户描述预算和用途，Agent 在多轮对话中维护需求、检索商品、查询评价并对比候选。React 界面展示回答与调试信息，FastAPI 提供聊天和会话接口。
+支持笔记本、手机、平板、无线耳机及显示器、键盘、鼠标的试点选购：用户描述预算和用途，Agent 在多轮对话中维护需求、检索商品、查询有来源的体验资料并对比候选。React 界面展示回答与调试信息，FastAPI 提供聊天和会话接口。
 
 例如：`预算 8000 元，主要办公，不打游戏，推荐几款笔记本。` 接着可以补充偏好、追问某款商品或比较候选，在同一会话中逐步完成选购。
 
-> 数据说明：真实商品数据信息需自行维护，也可采用模拟数据观察 Agent 行为；后续将补充模拟数据以方便使用。当前仓库不附带商品库和索引，完整对话需要先准备数据，并配置模型 API。
+> 仓库默认提供[500个真实型号、549条配置](datasets/real_catalog/README.md)：笔记本、手机各75型号，平板、无线耳机、显示器、键盘、鼠标各70型号。采用一个选定公开来源，价格为人民币快照，缺失字段显示“未知”；体验及真实对话能力仍为试点。首次初始化从JSONL导入双库并构建索引，无需访问商品网站；聊天需配置模型API。[补充验收标准](data_acceptance_criteria.md)记录本轮规则。
 
 [Docker 启动](#docker-启动) · [本地启动](#本地启动) · [Agent 设计](#agent-设计) · [测试与评测](#测试与评测)
 
@@ -16,14 +16,13 @@
 
 1. 克隆仓库，进入 `shopsift` 目录。
 2. 将 `.env.example` 复制为 `.env`，填写 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`LLM_MODEL`；已有配置时保留原文件。
-3. 按[数据契约](DEVELOPMENT.md#数据与索引)准备 `data/products.db` 和 `data/product_reviews.db`。
-4. 在仓库根目录执行：
+3. 在仓库根目录执行：
 
 ```bash
 docker compose up --build
 ```
 
-Compose 先检查配置与数据、加载嵌入模型，并在尚无索引时自动构建；初始化成功后启动后端，后端可访问后再启动前端。已有完整索引会复用。打开 [http://localhost:5173](http://localhost:5173)，按下方[对话示例](#4-体验一次多轮对话)体验。
+Compose 先检查配置，在默认双库均不存在时导入镜像内置 JSONL，加载嵌入模型并首次构建索引；初始化成功后启动后端，后端可访问后再启动前端。已有双库保持原样，匹配的完整索引会复用；部分、空或损坏的数据库会明确报错。打开 [http://localhost:5173](http://localhost:5173)，按下方[对话示例](#4-体验一次多轮对话)体验。
 
 首次运行需要下载镜像、依赖和嵌入模型；数据保存在 `./data`，模型缓存保存在命名卷中。初始化失败时查看 `docker compose logs init`；数据更新后的重建、离线使用与停止方式见[Docker 说明](DEVELOPMENT.md#docker)。模型 API 是否可用在实际对话时验证。
 
@@ -31,7 +30,7 @@ Compose 先检查配置与数据、加载嵌入模型，并在尚无索引时自
 
 ## 本地启动
 
-本地已验证 Python 3.12、Node.js 24。需要 Git、支持工具调用的 OpenAI-compatible 模型 API，以及商品与评价数据。首次安装依赖、构建索引需要联网下载包和嵌入模型；Redis 和 LangSmith 均为可选项，默认关闭。
+本地已验证 Python 3.12、Node.js 24。需要 Git 和支持工具调用的 OpenAI-compatible 模型 API；商品数据已随仓库提供。首次安装依赖、构建索引需要联网下载包和嵌入模型；Redis 和 LangSmith 均为可选项，默认关闭。
 
 ### 1. 获取代码并安装依赖
 
@@ -79,13 +78,13 @@ npm.cmd --prefix frontend ci
 | `OPENAI_BASE_URL` | OpenAI-compatible API 地址 |
 | `LLM_MODEL` | 支持工具调用的模型名 |
 
-按[数据契约](DEVELOPMENT.md#数据与索引)准备 `data/products.db` 和 `data/product_reviews.db`，然后在仓库根目录构建索引：
+在仓库根目录初始化内置数据与索引：
 
 ```bash
-python -m src.embeddings.product_embedder
+python -m backend.bootstrap
 ```
 
-终端输出 `Activated retrieval index ...` 表示索引构建完成。默认使用 `BAAI/bge-small-zh-v1.5`，首次运行会下载权重；以后仅在商品数据更新时重新构建，并重启后端。自定义数据路径或模型的方式见开发说明。
+终端输出 `Activated retrieval index ...` 或 `Reusing retrieval index ...` 表示准备完成。默认使用 `BAAI/bge-small-zh-v1.5`，首次运行会下载权重；初始化不调用聊天模型 API。数据或模型变化时用 `python -m backend.bootstrap --rebuild-index` 显式重建，并重启后端。仅校验或导入双库可使用不加载嵌入模型的 `python -m src.data.prepare_catalog --validate-only` / `python -m src.data.prepare_catalog`；自定义路径见[开发说明](DEVELOPMENT.md#数据与索引)。
 
 ### 3. 启动后端与前端
 
@@ -147,7 +146,7 @@ npm run build
 
 确定性评测使用真实图编排和受控依赖，不需要模型 API、商品库或嵌入权重。25 个案例验证路由、工具边界、画像与终止行为，报告写入 `evals/results/`；不能据此推断真实模型的回答质量。
 
-配置目标模型和商品数据后，可运行 Live 评测与 30 个 RAG 案例。RAG 案例绑定特定商品 ID，需要匹配的数据；命令、指标和门禁说明见[开发与评测说明](DEVELOPMENT.md)。
+准备内置数据与索引后，`python -m evals.retrieval_runner` 默认运行 76 条真实目录 RAG 案例，绑定目录版本与哈希，报告实际 Recall@5、命中率和来源覆盖率。`python -m evals.catalog_smoke` 验证七类商品的实际检索、工具及图流程，使用受控本地模型。原有 30 条契约集保持显式运行；远程 Live 评测需配置目标模型，命令与门禁见[开发说明](DEVELOPMENT.md)，本版结果见[外设试点验收](datasets/real_catalog/README.md)。
 
 ## 源码导航
 
@@ -156,9 +155,15 @@ npm run build
 | [`src/agent/`](src/agent/) | 图编排、阶段 Prompt、工具网关与证据校验接入 |
 | [`src/retrieval/`](src/retrieval/) | 混合召回、融合、约束、证据与活动索引清单 |
 | [`src/profile/`](src/profile/) | 画像候选生命周期与会话记忆 |
+| [`src/data/`](src/data/) / [`datasets/real_catalog/`](datasets/real_catalog/README.md) | 来源校验、双库导入与当前商品目录；仓库仅保留最新数据 |
 | [`backend/`](backend/) / [`frontend/`](frontend/) | FastAPI REST / SSE 与 React + TypeScript 界面 |
 | [`evals/`](evals/) / [`tests/`](tests/) | 评测案例、质量门禁与回归测试 |
 
 ## License
 
 MIT
+
+
+数据规模与品牌分布门禁已通过，七类的体验及真实对话能力仍为试点；参见[外设试点说明](datasets/real_catalog/README.md)。默认76条RAG案例绑定当前目录；目录与索引不匹配时会报告`blocked`。
+
+需要验证真实服务时运行 `python -m evals.catalog_smoke --live`，会使用现有API配置并隔离会话状态。用户已有自定义商品路径保持原样；切换目录前按试点说明显式导入新目录并切换两个商品路径。

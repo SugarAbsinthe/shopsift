@@ -28,7 +28,7 @@ class Config:
     OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openai-compatible")
-    LLM_MAX_OUTPUT_TOKENS: int = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "1200"))
+    LLM_MAX_OUTPUT_TOKENS: int = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "4096"))
     MODEL_PRICING_VERSION: str = os.getenv("MODEL_PRICING_VERSION", "unconfigured")
     MODEL_INPUT_COST_PER_1M: float | None = _optional_float("MODEL_INPUT_COST_PER_1M")
     MODEL_OUTPUT_COST_PER_1M: float | None = _optional_float("MODEL_OUTPUT_COST_PER_1M")
@@ -50,11 +50,11 @@ class Config:
 
     # Agent
     MAX_TOOL_ROUNDS: int = 3
-    MAX_LLM_CALLS: int = int(os.getenv("MAX_LLM_CALLS", "6"))
-    MAX_TOTAL_TOKENS: int = int(os.getenv("MAX_TOTAL_TOKENS", "12000"))
-    MAX_RUN_SECONDS: int = int(os.getenv("MAX_RUN_SECONDS", "55"))
+    MAX_LLM_CALLS: int = int(os.getenv("MAX_LLM_CALLS", "10"))
+    MAX_TOTAL_TOKENS: int = int(os.getenv("MAX_TOTAL_TOKENS", "32768"))
+    MAX_RUN_SECONDS: int = int(os.getenv("MAX_RUN_SECONDS", "120"))
     AGENT_REQUEST_TIMEOUT_SECONDS: int = int(
-        os.getenv("AGENT_REQUEST_TIMEOUT_SECONDS", "60")
+        os.getenv("AGENT_REQUEST_TIMEOUT_SECONDS", "150")
     )
 
     # Redis
