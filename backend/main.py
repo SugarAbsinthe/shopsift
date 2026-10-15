@@ -14,7 +14,7 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.routers import chat, conversations, health
+from backend.routers import chat, conversations, health, catalog
 from backend.logging_config import get_request_id, reset_request_id, set_request_id
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -24,6 +24,7 @@ app = FastAPI(
     description="Backend API for the ShopSift intelligent shopping assistant",
     version="1.0.0",
 )
+app.include_router(catalog.router, prefix="/api")
 
 
 @app.middleware("http")

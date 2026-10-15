@@ -78,3 +78,17 @@ def test_missing_structured_result_is_not_reported_as_verified():
     result = verify_answer("我建议购买产品 ID: 1。", None)
     assert result.status == "not_applicable"
     assert result.failure_codes == ["no_structured_retrieval"]
+
+
+def test_source_url_ids_and_prices_are_not_catalog_assertions():
+    checked = verify_answer("产品 ID: 1，价格: 7999 元。\n来源：https://example.com/view?product_id=24930&price=1234", _result())
+    assert checked.status == "verified"
+    assert checked.checked_product_ids == [1]
+    wrong = verify_answer("来源：https://example.com/view?product_id=24930\n产品 ID: 99，价格: 7999 元。", _result())
+    assert wrong.status == "failed"
+    assert wrong.checked_product_ids == [99]
+
+
+def test_chinese_brand_exclusion_blocks_english_brand_catalog():
+    result = _result(products=[ProductCandidate(product_id=1, brand="Xiaomi", category="手机", price=7999)], constraints={"excluded_brands": ["小米"]})
+    assert "constraint_violation" in verify_answer("产品 ID: 1。", result).failure_codes

@@ -31,3 +31,10 @@ def test_query_rejects_blank_text_and_unsafe_result_size():
         RetrievalQuery(text=" \n ")
     with pytest.raises(ValidationError):
         RetrievalQuery(text="laptop", top_k=1000)
+
+
+def test_brand_aliases_preserve_labels_and_cannot_conflict():
+    normalized = RetrievalConstraints(excluded_brands=["小米", "Xiaomi", "REDMI"])
+    assert normalized.excluded_brands == ["小米"]
+    with pytest.raises(ValidationError, match="both preferred and excluded"):
+        RetrievalConstraints(preferred_brands=["Apple"], excluded_brands=["苹果"])

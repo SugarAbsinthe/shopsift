@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from src.retrieval.models import canonical_brand
+from src.retrieval.models import SpecFilter
 
 
 RetrievalSource = Literal["description", "spec", "sparse"]
@@ -19,6 +21,7 @@ class RetrievalConstraints(BaseModel):
     category: str = ""
     preferred_brands: list[str] = Field(default_factory=list)
     excluded_brands: list[str] = Field(default_factory=list)
+    spec_filters: list[SpecFilter] = Field(default_factory=list)
 
     @field_validator("preferred_brands", "excluded_brands")
     @classmethod
@@ -37,8 +40,8 @@ class RetrievalConstraints(BaseModel):
         ):
             raise ValueError("min_price cannot exceed max_price")
         overlap = {
-            brand.casefold() for brand in self.preferred_brands
-        } & {brand.casefold() for brand in self.excluded_brands}
+            canonical_brand(brand) for brand in self.preferred_brands
+        } & {canonical_brand(brand) for brand in self.excluded_brands}
         if overlap:
             raise ValueError("a brand cannot be both preferred and excluded")
         return self
@@ -54,6 +57,10 @@ class RetrievalCase(BaseModel):
     forbidden_ids: list[int] = Field(default_factory=list)
     required_sources: list[RetrievalSource] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    min_distinct_models: int | None = Field(default=None, ge=1, le=20)
+    review_product_id: int | None = Field(default=None, gt=0)
+    review_aspect: str = ""
+    expected_summary_keys: list[str] = Field(default_factory=list)
 
     @field_validator("relevant_ids", "forbidden_ids", "required_sources", "tags")
     @classmethod

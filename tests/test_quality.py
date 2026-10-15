@@ -17,7 +17,7 @@ from evals.quality import (
 
 def test_default_manifest_validates_case_count_and_checksum():
     manifest, context = validate_dataset_artifact(
-        "evals/datasets/v1/manifest.json", "agent-behavior-v1"
+        "evals/datasets/contracts/manifest.json", "agent-behavior-v1"
     )
     assert manifest.dataset_version == "v1"
     assert context.case_count == 25

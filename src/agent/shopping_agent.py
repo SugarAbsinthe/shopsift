@@ -25,6 +25,7 @@ from src.agent.shopping_prompts import (
     COMPARE_AGENT_PROMPT,
     RECOMMEND_AGENT_PROMPT,
     SHOPPING_PROMPT_VERSION,
+    COMMON_STYLE_GUIDE,
 )
 from src.config import config
 
@@ -50,14 +51,14 @@ class ShoppingGuideAgent:
         self.product_retriever = product_retriever
         self.profile_store = profile_store
         self.catalog_db = catalog_db or config.PRODUCT_DB_PATH
-        self.reviews_db = reviews_db or str(Path(config.PRODUCT_DB_PATH).parent / "product_reviews.db")
+        self.reviews_db = reviews_db or str(Path(self.catalog_db).parent / "product_reviews.db")
         self.max_tool_rounds = max_tool_rounds
         self._system_prompt = system_prompt  # kept for run_simple fallback
 
         # Create tools via factory functions (no module globals)
         tools = [
             create_get_product_detail(self.catalog_db),
-            create_get_reviews(self.reviews_db),
+            create_get_reviews(self.reviews_db, getattr(product_retriever, "chroma_dir", config.PRODUCT_CHROMA_DIR), catalog_db=self.catalog_db),
             create_compare_products(self.catalog_db),
             create_get_user_profile(profile_store),
         ]
@@ -229,7 +230,7 @@ class ShoppingGuideAgent:
             product_context = "(产品检索暂不可用)"
 
         prompt = ChatPromptTemplate.from_messages([
-            ("system", SHOPPING_SYSTEM_PROMPT),
+            ("system", self._system_prompt + COMMON_STYLE_GUIDE),
             ("user", "{question}"),
         ])
 

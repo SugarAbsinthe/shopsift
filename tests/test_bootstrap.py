@@ -70,7 +70,7 @@ class Client:
     def get_collection(self, name):
         return self.collections[name]
 
-    def create_collection(self, name):
+    def create_collection(self, name, **kwargs):
         self.collections[name] = Collection(name, count=0)
         return self.collections[name]
 
@@ -229,16 +229,34 @@ def test_first_build_and_restart_with_real_chroma(settings, monkeypatch):
     assert load_index_manifest(settings.PRODUCT_CHROMA_DIR) == active
 
 
-@pytest.mark.parametrize("empty_channel", ["specs", "reviews"])
-def test_empty_optional_channel_can_be_built_and_reused(settings, monkeypatch, empty_channel):
-    if empty_channel == "specs":
-        with closing(sqlite3.connect(settings.PRODUCT_DB_PATH)) as conn, conn:
-            conn.execute("UPDATE products SET specs = '{}'")
-    else:
-        reviews = Path(settings.PRODUCT_DB_PATH).parent / "product_reviews.db"
-        with closing(sqlite3.connect(reviews)) as conn, conn:
-            conn.execute("DELETE FROM product_reviews")
+def test_empty_optional_specs_can_be_built_and_reused(settings, monkeypatch):
+    with closing(sqlite3.connect(settings.PRODUCT_DB_PATH)) as conn, conn:
+        conn.execute("UPDATE products SET specs = '{}'")
     dependencies(monkeypatch, Client())
     assert bootstrap.prepare_runtime(settings) == "built"
-    assert load_index_manifest(settings.PRODUCT_CHROMA_DIR)["counts"][empty_channel] == 0
+    assert load_index_manifest(settings.PRODUCT_CHROMA_DIR)["counts"]["specs"] == 0
     assert bootstrap.prepare_runtime(settings) == "reused"
+
+
+def test_empty_reviews_are_rejected_before_model_load(settings, monkeypatch):
+    reviews = Path(settings.PRODUCT_DB_PATH).parent / "product_reviews.db"
+    with closing(sqlite3.connect(reviews)) as conn, conn:
+        conn.execute("DELETE FROM product_reviews")
+    loaded = dependencies(monkeypatch, Client())
+    with pytest.raises(bootstrap.BootstrapError, match="product_reviews is empty"):
+        bootstrap.prepare_runtime(settings)
+    assert not loaded
+
+
+def test_catalog_change_is_rejected_before_model_load(settings, monkeypatch):
+    from src.data.catalog import catalog_fingerprint
+    active = manifest()
+    reviews = Path(settings.PRODUCT_DB_PATH).parent / "product_reviews.db"
+    active["catalog_fingerprint"] = catalog_fingerprint(settings.PRODUCT_DB_PATH, reviews)
+    activate_index_manifest(settings.PRODUCT_CHROMA_DIR, active)
+    with closing(sqlite3.connect(settings.PRODUCT_DB_PATH)) as conn, conn:
+        conn.execute("UPDATE products SET price = 6000")
+    loaded = dependencies(monkeypatch, Client(active["collections"].values()))
+    with pytest.raises(bootstrap.BootstrapError, match="Catalog content changed"):
+        bootstrap.prepare_runtime(settings)
+    assert not loaded

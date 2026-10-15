@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml .
 COPY src/ ./src/
 COPY backend/ ./backend/
+COPY datasets/ ./datasets/
 RUN pip install --no-cache-dir -e .
 
 EXPOSE 8000

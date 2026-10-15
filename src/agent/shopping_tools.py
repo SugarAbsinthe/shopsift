@@ -18,6 +18,7 @@ from langchain.tools import tool
 
 from src.config import config
 from src.retrieval.index_manifest import resolve_collection_names
+from src.data.catalog import load_provenance, value_or_unknown, format_product_sources, format_review_source
 
 # Module-level state
 _product_retriever = None
@@ -36,11 +37,7 @@ def init_shopping_tools(product_retriever, profile_store, catalog_db: str, revie
 
 
 def _query_catalog(product_id: int) -> Optional[dict]:
-    conn = sqlite3.connect(_catalog_db)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM products WHERE product_id = ?", (product_id,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
+    return _query_catalog_static(_catalog_db, product_id)
 
 
 @tool
@@ -71,6 +68,56 @@ def _format_specs(specs: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_detail(p: dict) -> str:
+    specs = json.loads(p["specs"]) if p["specs"] else {}
+    sources = format_product_sources(p.get("_provenance", {}))
+    return (
+        f"【{p['name']}】（产品ID={p['product_id']}）\n"
+        f"  品牌: {p['brand']}  品类: {p['category']} / {p['subcategory']}\n"
+        f"  价格: ¥{value_or_unknown(p['price'])}\n"
+        f"  评分: {value_or_unknown(p['rating'])}  销量: {value_or_unknown(p['sales_count'])}\n"
+        f"  发布日期: {value_or_unknown(p['release_date'])}\n"
+        f"  详细参数:\n{_format_specs(specs)}\n"
+        f"  简介: {p['description']}"
+        + ("\n" + sources if sources else "")
+    )
+
+
+def _get_sourced_reviews(reviews_db: str, persist_dir: str, product_id: int, aspect: str, top_k: int, catalog_db: str | None = None) -> str:
+    import chromadb
+    try:
+        client = chromadb.PersistentClient(path=persist_dir)
+        collection_names, _ = resolve_collection_names(persist_dir)
+        col = client.get_collection(collection_names["reviews"])
+    except Exception:
+        return "体验数据暂时不可用"
+    where = {"product_id": product_id}
+    if aspect:
+        where = {"$and": [{"product_id": product_id}, {"aspect": aspect}]}
+    try:
+        results = col.get(where=where, limit=max(1, min(top_k, 8)), include=["documents", "metadatas"])
+    except Exception:
+        return "查阅体验资料时出错"
+    if not results["ids"]:
+        return f"该产品暂无{'关于' + aspect if aspect else '相关'}可核验体验摘要"
+    lines = [f"共 {len(results['ids'])} 条有来源的体验摘要（个别来源观点）:\n"]
+    for doc, meta in zip(results["documents"], results["metadatas"]):
+        meta = meta or {}
+        if catalog_db and meta.get("source_id"):
+            try:
+                with sqlite3.connect(Path(catalog_db).resolve().as_uri() + "?mode=ro", uri=True) as conn:
+                    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='catalog_sources'").fetchone():
+                        row = conn.execute("SELECT metadata FROM catalog_sources WHERE source_id=?", (meta["source_id"],)).fetchone()
+                        if row and (notice := json.loads(row[0]).get("disclosure")):
+                            lines.append("  来源声明: " + notice)
+            except (OSError, sqlite3.Error):
+                pass
+        label = {"positive": "正面", "negative": "负面", "neutral": "中性", "mixed": "褒贬并存"}.get(meta.get("sentiment"), "未知")
+        lines.append(f"  [{label}] {meta.get('aspect', '')}: {meta.get('content', doc)}")
+        lines.append("  " + format_review_source(meta))
+    return "\n".join(lines)
+
+
 @tool
 def get_product_detail(product_id: int) -> str:
     """Get the complete specification sheet for a specific product.
@@ -85,22 +132,12 @@ def get_product_detail(product_id: int) -> str:
     if not p:
         return f"未找到产品 ID={product_id}"
 
-    specs = json.loads(p["specs"]) if p["specs"] else {}
-
-    return (
-        f"【{p['name']}】\n"
-        f"  品牌: {p['brand']}  品类: {p['category']} / {p['subcategory']}\n"
-        f"  价格: ¥{p['price']}\n"
-        f"  评分: {p['rating']} 分  销量: {p['sales_count']}\n"
-        f"  发布日期: {p['release_date']}\n"
-        f"  详细参数:\n{_format_specs(specs)}\n"
-        f"  简介: {p['description']}"
-    )
+    return _format_detail(p)
 
 
 @tool
 def get_reviews(product_id: int, aspect: str = "", top_k: int = 5) -> str:
-    """Get user reviews for a specific product, optionally filtered by aspect.
+    """Get sourced user experiences or editorial reviews, filtered by aspect.
 
     Use this tool when the user asks about product quality, reliability,
     or specific concerns (performance, build quality, battery, photo quality, etc.).
@@ -110,46 +147,10 @@ def get_reviews(product_id: int, aspect: str = "", top_k: int = 5) -> str:
         aspect: Optional filter. Leave empty to get reviews from all aspects.
         top_k: Max reviews to return (default 5).
     """
-    import chromadb
-    persist_dir = str(Path(_reviews_db).parent / "product_chroma_db")
-    client = chromadb.PersistentClient(path=persist_dir)
-    try:
-        collection_names, _ = resolve_collection_names(persist_dir)
-        col = client.get_collection(collection_names["reviews"])
-    except Exception:
-        return "评价数据暂时不可用"
-
-    where = {"product_id": product_id}
-    if aspect:
-        where["aspect"] = aspect
-
-    try:
-        results = col.get(where=where, limit=top_k, include=["documents", "metadatas"])
-    except Exception:
-        return "查阅评价时出错"
-
-    if not results["ids"]:
-        return f"该产品暂无{'关于' + aspect if aspect else '相关'}评价"
-
-    lines = [f"共 {len(results['ids'])} 条评价:\n"]
-    for i, doc in enumerate(results["documents"]):
-        meta = results["metadatas"][i]
-        emoji = "[绿]" if meta.get("sentiment") == "positive" else "[红]"
-        lines.append(f"  {emoji} {meta.get('aspect', '')}: {doc}")
-    return "\n".join(lines)
+    return _get_sourced_reviews(_reviews_db, config.PRODUCT_CHROMA_DIR, product_id, aspect, top_k)
 
 
-@tool
-def compare_products(product_ids: str) -> str:
-    """Compare 2-4 products side by side across all key specifications.
-
-    Use this tool when the user wants to compare specific products or
-    is deciding between a few options.
-
-    Args:
-        product_ids: Comma-separated list of product IDs, e.g. '1,5,12'.
-                     Provide 2 to 4 IDs for a meaningful comparison.
-    """
+def _compare_catalog_products(catalog_db: str, product_ids: str) -> str:
     ids = [int(x.strip()) for x in product_ids.split(",") if x.strip()]
     if len(ids) < 2:
         return "请提供至少 2 个产品 ID 进行对比"
@@ -158,7 +159,7 @@ def compare_products(product_ids: str) -> str:
 
     products = []
     for pid in ids:
-        p = _query_catalog(pid)
+        p = _query_catalog_static(catalog_db, pid)
         if p:
             p["_specs"] = json.loads(p["specs"]) if p["specs"] else {}
             products.append(p)
@@ -169,19 +170,19 @@ def compare_products(product_ids: str) -> str:
     # Common fields
     common_fields = [
         ("品牌", "brand"), ("品类", "category"), ("子类", "subcategory"),
-        ("价格", "price"), ("评分", "rating"),
+        ("价格", "price"), ("评分", "rating"), ("销量", "sales_count"), ("发布日期", "release_date"),
     ]
 
     lines = ["## 产品对比\n"]
-    header = "| 属性 |" + "|".join(f" {p['name'][:15]} " for p in products) + "|"
+    header = "| 属性 |" + "|".join(f" {p['name']} " for p in products) + "|"
     lines.append(header)
     lines.append("|---|" + "|".join("---" for _ in products) + "|")
 
     for label, key in common_fields:
         vals = []
         for p in products:
-            v = p.get(key, "?")
-            if key == "price" and v != "?":
+            v = value_or_unknown(p.get(key))
+            if key == "price" and v != "未知":
                 v = f"¥{v}"
             vals.append(str(v))
         lines.append(f"| {label} |" + "|".join(f" {v} " for v in vals) + "|")
@@ -196,11 +197,29 @@ def compare_products(product_ids: str) -> str:
     for key in all_spec_keys:
         vals = []
         for p in products:
-            v = p.get("_specs", {}).get(key, "-")
-            vals.append(str(v)[:25])
+            v = value_or_unknown(p.get("_specs", {}).get(key))
+            vals.append(str(v).replace("|", "\\|").replace("\n", " "))
         lines.append(f"| {key} |" + "|".join(f" {v} " for v in vals) + "|")
 
+    for p in products:
+        sources = format_product_sources(p.get("_provenance", {}))
+        if sources:
+            lines.append(f"\n{p['name']}（产品ID={p['product_id']}）\n{sources}")
     return "\n".join(lines)
+
+
+@tool
+def compare_products(product_ids: str) -> str:
+    """Compare 2-4 products side by side across all key specifications.
+
+    Use this tool when the user wants to compare specific products or
+    is deciding between a few options.
+
+    Args:
+        product_ids: Comma-separated list of product IDs, e.g. '1,5,12'.
+                     Provide 2 to 4 IDs for a meaningful comparison.
+    """
+    return _compare_catalog_products(_catalog_db, product_ids)
 
 
 @tool
@@ -278,7 +297,7 @@ def create_search_products(product_retriever):
 
 def create_get_product_detail(catalog_db: str):
     """Factory: returns a get_product_detail tool closing over a specific catalog path."""
-    @tool("get_product_detail")
+    @tool("get_product_detail", response_format="content_and_artifact")
     def _get_product_detail(product_id: int) -> str:
         """Get the complete specification sheet for a specific product.
 
@@ -290,25 +309,15 @@ def create_get_product_detail(catalog_db: str):
         """
         p = _query_catalog_static(catalog_db, product_id)
         if not p:
-            return f"未找到产品 ID={product_id}"
+            return f"未找到产品 ID={product_id}", {}
 
-        specs = json.loads(p["specs"]) if p["specs"] else {}
-
-        return (
-            f"【{p['name']}】\n"
-            f"  品牌: {p['brand']}  品类: {p['category']} / {p['subcategory']}\n"
-            f"  价格: ¥{p['price']}\n"
-            f"  评分: {p['rating']} 分  销量: {p['sales_count']}\n"
-            f"  发布日期: {p['release_date']}\n"
-            f"  详细参数:\n{_format_specs(specs)}\n"
-            f"  简介: {p['description']}"
-        )
+        return _format_detail(p), _catalog_artifact([p])
     return _get_product_detail
 
 
-def create_get_reviews(reviews_db: str):
+def create_get_reviews(reviews_db: str, chroma_dir: Optional[str] = None, *, catalog_db: Optional[str] = None):
     """Factory: returns a get_reviews tool closing over a specific reviews path."""
-    @tool("get_reviews")
+    @tool("get_reviews", response_format="content_and_artifact")
     def _get_reviews(product_id: int, aspect: str = "", top_k: int = 5) -> str:
         """Get user reviews for a specific product, optionally filtered by aspect.
 
@@ -320,40 +329,17 @@ def create_get_reviews(reviews_db: str):
             aspect: Optional filter. Leave empty to get reviews from all aspects.
             top_k: Max reviews to return (default 5).
         """
-        import chromadb
-        from pathlib import Path as _Path
-        persist_dir = str(_Path(reviews_db).parent / "product_chroma_db")
-        client = chromadb.PersistentClient(path=persist_dir)
-        try:
-            collection_names, _ = resolve_collection_names(persist_dir)
-            col = client.get_collection(collection_names["reviews"])
-        except Exception:
-            return "评价数据暂时不可用"
-
-        where = {"product_id": product_id}
-        if aspect:
-            where["aspect"] = aspect
-
-        try:
-            results = col.get(where=where, limit=top_k, include=["documents", "metadatas"])
-        except Exception:
-            return "查阅评价时出错"
-
-        if not results["ids"]:
-            return f"该产品暂无{'关于' + aspect if aspect else '相关'}评价"
-
-        lines = [f"共 {len(results['ids'])} 条评价:\n"]
-        for i, doc in enumerate(results["documents"]):
-            meta = results["metadatas"][i]
-            emoji = "[绿]" if meta.get("sentiment") == "positive" else "[红]"
-            lines.append(f"  {emoji} {meta.get('aspect', '')}: {doc}")
-        return "\n".join(lines)
+        persist_dir = chroma_dir or str(Path(reviews_db).parent / "product_chroma_db")
+        product_path = catalog_db or str(Path(reviews_db).parent / "products.db")
+        content = _get_sourced_reviews(reviews_db, persist_dir, product_id, aspect, top_k, product_path)
+        product = _query_catalog_static(product_path, product_id) if Path(product_path).is_file() else None
+        return content, _catalog_artifact([product] if product else [])
     return _get_reviews
 
 
 def create_compare_products(catalog_db: str):
     """Factory: returns a compare_products tool closing over a specific catalog path."""
-    @tool("compare_products")
+    @tool("compare_products", response_format="content_and_artifact")
     def _compare_products(product_ids: str) -> str:
         """Compare 2-4 products side by side across all key specifications.
 
@@ -364,56 +350,24 @@ def create_compare_products(catalog_db: str):
             product_ids: Comma-separated list of product IDs, e.g. '1,5,12'.
                          Provide 2 to 4 IDs for a meaningful comparison.
         """
-        ids = [int(x.strip()) for x in product_ids.split(",") if x.strip()]
-        if len(ids) < 2:
-            return "请提供至少 2 个产品 ID 进行对比"
-        if len(ids) > 4:
-            ids = ids[:4]
-
-        products = []
-        for pid in ids:
-            p = _query_catalog_static(catalog_db, pid)
-            if p:
-                p["_specs"] = json.loads(p["specs"]) if p["specs"] else {}
-                products.append(p)
-
-        if not products:
-            return "未找到指定的产品"
-
-        common_fields = [
-            ("品牌", "brand"), ("品类", "category"), ("子类", "subcategory"),
-            ("价格", "price"), ("评分", "rating"),
-        ]
-
-        lines = ["## 产品对比\n"]
-        header = "| 属性 |" + "|".join(f" {p['name'][:15]} " for p in products) + "|"
-        lines.append(header)
-        lines.append("|---|" + "|".join("---" for _ in products) + "|")
-
-        for label, key in common_fields:
-            vals = []
-            for p in products:
-                v = p.get(key, "?")
-                if key == "price" and v != "?":
-                    v = f"¥{v}"
-                vals.append(str(v))
-            lines.append(f"| {label} |" + "|".join(f" {v} " for v in vals) + "|")
-
-        all_spec_keys = []
-        for p in products:
-            for k in p.get("_specs", {}):
-                if k not in all_spec_keys:
-                    all_spec_keys.append(k)
-
-        for key in all_spec_keys:
-            vals = []
-            for p in products:
-                v = p.get("_specs", {}).get(key, "-")
-                vals.append(str(v)[:25])
-            lines.append(f"| {key} |" + "|".join(f" {v} " for v in vals) + "|")
-
-        return "\n".join(lines)
+        content = _compare_catalog_products(catalog_db, product_ids)
+        ids = [int(x.strip()) for x in product_ids.split(",") if x.strip()][:4]
+        products = [_query_catalog_static(catalog_db, pid) for pid in ids] if len(ids) >= 2 else []
+        return content, _catalog_artifact([p for p in products if p])
     return _compare_products
+
+
+def _catalog_artifact(rows: list[dict]) -> dict:
+    from src.data.categories import catalog_filter_specs
+    from src.retrieval.models import ProductCandidate
+    from src.retrieval.product_retriever import ProductRetriever
+    products = [ProductCandidate(**{k: p.get(k) for k in (
+        "product_id", "name", "brand", "category", "subcategory", "price", "rating", "sales_count", "description")},
+        release_date=p.get("release_date") or "", specs=json.loads(p["specs"]),
+        provenance=p.get("_provenance", {}), normalized_specs=catalog_filter_specs(
+            p.get("category", ""), json.loads(p["specs"]), p.get("_provenance", {}).get("normalized_specs", {}))) for p in rows]
+    return {"products": [p.model_dump() for p in products],
+            "evidence": [e.model_dump() for e in ProductRetriever._build_evidence(products, "catalog-tool")]}
 
 
 def create_get_user_profile(profile_store):
@@ -458,8 +412,12 @@ def create_update_user_profile(profile_store):
 
 def _query_catalog_static(catalog_db: str, product_id: int) -> Optional[dict]:
     """Stateless SQLite catalog lookup for use by factory-created tools."""
-    conn = sqlite3.connect(catalog_db)
+    conn = sqlite3.connect(Path(catalog_db).resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     row = conn.execute("SELECT * FROM products WHERE product_id = ?", (product_id,)).fetchone()
     conn.close()
-    return dict(row) if row else None
+    if row is None:
+        return None
+    product = dict(row)
+    product["_provenance"] = load_provenance(catalog_db, "product_provenance", [product_id]).get(product_id, {})
+    return product

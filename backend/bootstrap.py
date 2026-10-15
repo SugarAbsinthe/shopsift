@@ -1,6 +1,6 @@
-"""Prepare a user-supplied catalog and embedding index before Compose starts.
+"""Prepare an existing catalog, or import the bundled catalog on a fresh install.
 
-No model API requests, seed data, source database writes or index deletion.
+No model API requests, replacement of user catalogs, or index deletion.
 """
 
 from __future__ import annotations
@@ -36,12 +36,14 @@ def validate_database(path: Path, table: str) -> None:
         raise BootstrapError(f"Missing {path}; prepare your catalog as described in DEVELOPMENT.md.")
     try:
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+            if conn.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                raise BootstrapError(f"{path}: SQLite integrity check failed.")
             fields = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
             missing = _TABLE_FIELDS[table] - fields
             if missing:
                 raise BootstrapError(f"{path}: {table} is missing fields: {', '.join(sorted(missing))}.")
-            if table == "products" and not conn.execute("SELECT 1 FROM products LIMIT 1").fetchone():
-                raise BootstrapError(f"{path}: products is empty; supply product data first.")
+            if not conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone():
+                raise BootstrapError(f"{path}: {table} is empty; prepare the catalog explicitly.")
     except sqlite3.Error as exc:
         raise BootstrapError(f"Cannot read {path} as a valid SQLite catalog.") from exc
 
@@ -72,6 +74,14 @@ def prepare_runtime(settings, *, rebuild_index: bool = False) -> str:
 
     products = Path(settings.PRODUCT_DB_PATH)
     reviews = products.parent / "product_reviews.db"
+    from src.data.catalog import CatalogError, catalog_fingerprint
+    from src.data.prepare_catalog import ensure_default_catalog
+    try:
+        ensure_default_catalog(products)
+    except (CatalogError, OSError, sqlite3.Error) as exc:
+        raise BootstrapError(f"Bundled catalog preparation failed: {exc}") from exc
+    if (products.parent / f".{products.name}.catalog-import.json").exists():
+        raise BootstrapError("Interrupted catalog import; rerun python -m src.data.prepare_catalog for this destination before indexing.")
     validate_database(products, "products")
     validate_database(reviews, "product_reviews")
 
@@ -81,6 +91,9 @@ def prepare_runtime(settings, *, rebuild_index: bool = False) -> str:
         raise BootstrapError("Invalid retrieval_manifest.json; inspect it or explicitly rebuild the index.")
     if not rebuild_index and manifest and manifest.get("embedding_model") != settings.EMBEDDING_MODEL:
         raise BootstrapError("EMBEDDING_MODEL differs from the active index; align it or explicitly rebuild.")
+    if not rebuild_index and manifest and manifest.get("catalog_fingerprint"):
+        if catalog_fingerprint(products, reviews) != manifest["catalog_fingerprint"]:
+            raise BootstrapError("Catalog content changed; explicitly rebuild the index with --rebuild-index.")
 
     # Warm the configured embedding model even when reusing an index. This also
     # prepares an initially empty named cache volume before the API starts.

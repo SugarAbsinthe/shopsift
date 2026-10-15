@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 REPORT_SCHEMA_VERSION = 1
 DEFAULT_DATASET_MANIFEST_PATH = (
-    Path(__file__).resolve().parent / "datasets" / "v1" / "manifest.json"
+    Path(__file__).resolve().parent / "datasets" / "contracts" / "manifest.json"
 )
 
 
@@ -29,6 +29,8 @@ class DatasetArtifact(BaseModel):
     sha256: str = Field(pattern=r"^[A-Fa-f0-9]{64}$")
     scope: list[str] = Field(default_factory=list)
     runtime_preconditions: list[str] = Field(default_factory=list)
+    catalog_fingerprint: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{64}$")
+    catalog_version: str | None = None
 
     @field_validator("path")
     @classmethod
@@ -100,6 +102,8 @@ class DatasetContext:
     path: str
     sha256: str
     case_count: int
+    catalog_fingerprint: str | None = None
+    catalog_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -201,6 +205,8 @@ def validate_dataset_artifact(
         path=artifact_path.relative_to(repository_root).as_posix(),
         sha256=observed_hash,
         case_count=observed_count,
+        catalog_fingerprint=artifact.catalog_fingerprint,
+        catalog_version=artifact.catalog_version,
     )
 
 

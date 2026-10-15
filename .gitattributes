@@ -1,0 +1,4 @@
+# Keep checksummed catalog and evaluation artifacts byte-for-byte on checkout.
+datasets/real_catalog/** -text whitespace=cr-at-eol
+evals/datasets/** -text whitespace=cr-at-eol
+evals/*.jsonl -text whitespace=cr-at-eol

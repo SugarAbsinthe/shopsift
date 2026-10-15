@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "policy_id": "seven-categories-500-models-v1",
+  "minimum_models": 500,
+  "minimum_models_per_category": 60,
+  "target_models": {
+    "笔记本电脑": 75,
+    "手机": 75,
+    "平板电脑": 70,
+    "无线耳机": 70,
+    "显示器": 70,
+    "键盘": 70,
+    "鼠标": 70
+  },
+  "minimum_brands_per_category": 4,
+  "maximum_brand_share": 0.30,
+  "maximum_seller_share": 0.50,
+  "maximum_platform_share": 0.60,
+  "maximum_experience_site_share": 0.50,
+  "counting_basis": "Distinct verified model_key values. Storage, memory, colour, switch and merchant variants do not add model counts.",
+  "historical_versions_count_separately": false
+}

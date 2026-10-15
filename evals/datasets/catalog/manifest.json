@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "dataset_version": "v5-expanded-catalog",
+  "created_at": "2026-10-15T04:32:05.358435+00:00",
+  "description": "76条真实目录案例；按公开事实与规范硬条件独立标注，绑定当前500型号目录。",
+  "cases": [
+    {
+      "id": "retrieval-real-catalog-v4",
+      "path": "evals/datasets/catalog/retrieval_cases.jsonl",
+      "format": "jsonl",
+      "case_count": 76,
+      "sha256": "603971fb545e8b3ca66fc05c395ab9a66a79f9f9050b2355742fc60b4d86647a",
+      "scope": [
+        "retrieval",
+        "seven-categories",
+        "500-models",
+        "pilot"
+      ],
+      "catalog_version": "real-catalog-v4-500-models",
+      "catalog_fingerprint": "9a889f81a02b6adf8bf72055d15cf4698ed7f5364d566ea1d6a25608536aedf9"
+    }
+  ],
+  "quality_gates": [
+    {
+      "name": "retrieval-peripheral-safety",
+      "mode": "retrieval",
+      "dataset_id": "retrieval-real-catalog-v4",
+      "minimums": {
+        "exact_hit_rate": 1.0,
+        "provenance_coverage": 1.0
+      },
+      "maximums": {
+        "forbidden_violations": 0,
+        "constraint_violations": 0,
+        "empty_result_violations": 0,
+        "diversity_violations": 0,
+        "experience_violations": 0
+      }
+    }
+  ]
+}

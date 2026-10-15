@@ -19,8 +19,13 @@ from evals.quality import (
     get_quality_gate,
     validate_dataset_artifact,
 )
-from src.retrieval.models import RetrievalQuery
-from src.retrieval.index_manifest import resolve_collection_names
+from src.retrieval.models import RetrievalQuery, canonical_brand
+from src.retrieval.index_manifest import resolve_collection_names, load_index_manifest, MANIFEST_FILENAME
+from src.data.catalog import catalog_fingerprint
+
+
+REAL_DATASET_ID = "retrieval-real-catalog-v4"
+REAL_DATASET_DIRECTORY = Path(__file__).resolve().parent / "datasets" / "catalog"
 
 
 @dataclass
@@ -39,7 +44,9 @@ class RetrievalPreflight:
         }
 
 
-def preflight_retrieval(catalog_db: Path | str, chroma_dir: Path | str) -> RetrievalPreflight:
+def preflight_retrieval(catalog_db: Path | str, chroma_dir: Path | str, *,
+                        expected_catalog_fingerprint: str | None = None,
+                        embedding_model: str | None = None) -> RetrievalPreflight:
     """Check database and active Chroma collections without running retrieval."""
     issues: list[str] = []
     catalog_path = Path(catalog_db)
@@ -58,6 +65,21 @@ def preflight_retrieval(catalog_db: Path | str, chroma_dir: Path | str) -> Retri
             issues.append("RETRIEVAL_DB_INVALID")
 
     index_version: str | None = None
+    active_manifest = load_index_manifest(chroma_path)
+    if (chroma_path / MANIFEST_FILENAME).exists() and active_manifest is None:
+        issues.append("RETRIEVAL_INDEX_MANIFEST_INVALID")
+    if active_manifest and embedding_model and active_manifest.get("embedding_model") != embedding_model:
+        issues.append("RETRIEVAL_EMBEDDING_MODEL_MISMATCH")
+    expected_index = active_manifest.get("catalog_fingerprint") if active_manifest else None
+    if catalog_path.is_file() and (expected_catalog_fingerprint or expected_index):
+        try:
+            observed = catalog_fingerprint(catalog_path, catalog_path.parent / "product_reviews.db")
+            if expected_catalog_fingerprint and observed != expected_catalog_fingerprint.lower():
+                issues.append("RETRIEVAL_CATALOG_DATASET_MISMATCH")
+            if expected_index and observed != expected_index:
+                issues.append("RETRIEVAL_CATALOG_INDEX_MISMATCH")
+        except (OSError, ValueError, sqlite3.Error):
+            issues.append("RETRIEVAL_CATALOG_INVALID")
     if not chroma_path.is_dir():
         issues.append("RETRIEVAL_INDEX_DIR_MISSING")
     else:
@@ -92,13 +114,28 @@ class RetrievalEvaluation:
     forbidden_violations: int = 0
     constraint_violations: int = 0
     empty_result_violations: int = 0
+    exact_cases: int = 0
+    exact_hits: int = 0
     required_sources_total: int = 0
     required_sources_met: int = 0
+    returned_products: int = 0
+    sourced_products: int = 0
+    diversity_violations: int = 0
+    experience_violations: int = 0
+    observations: list[dict[str, Any]] = field(default_factory=list)
     failures: list[dict[str, Any]] = field(default_factory=list)
 
     def snapshot(self) -> dict[str, Any]:
+        other = [row for row in self.observations if "exact_config" not in row["tags"]]
+        other_relevant = [row for row in other if row["relevant_ids"]]
+        other_gold = sum(len(row["relevant_ids"]) for row in other_relevant)
+        other_hits = sum(len(row["hit_ids"]) for row in other_relevant)
+        other_sources = sum(len(row["required_sources"]) for row in other)
+        other_met = sum(len(set(row["required_sources"]) & set(row["observed_sources"])) for row in other)
         return {
             "cases": self.cases,
+            "diversity_violations": self.diversity_violations,
+            "experience_violations": self.experience_violations,
             "hit_rate": round(self.hit_cases / self.relevant_cases, 4)
             if self.relevant_cases else None,
             "recall_at_k": round(self.relevant_retrieved / self.relevant_total, 4)
@@ -106,10 +143,22 @@ class RetrievalEvaluation:
             "source_coverage": round(
                 self.required_sources_met / self.required_sources_total, 4
             ) if self.required_sources_total else None,
+            "provenance_coverage": round(self.sourced_products / self.returned_products, 4)
+            if self.returned_products else None,
             "forbidden_violations": self.forbidden_violations,
             "constraint_violations": self.constraint_violations,
             "empty_result_violations": self.empty_result_violations,
+            "exact_cases": self.exact_cases,
+            "exact_hits": self.exact_hits,
+            "exact_hit_rate": round(self.exact_hits / self.exact_cases, 4) if self.exact_cases else None,
+            "non_exact_metrics": {
+                "cases": len(other), "nonempty_gold_cases": len(other_relevant),
+                "hit_rate": round(sum(bool(row["hit_ids"]) for row in other_relevant) / len(other_relevant), 4) if other_relevant else None,
+                "recall_at_k": round(other_hits / other_gold, 4) if other_gold else None,
+                "source_coverage": round(other_met / other_sources, 4) if other_sources else None,
+            },
             "failures": self.failures,
+            "observations": self.observations,
         }
 
 
@@ -192,8 +241,9 @@ def _violates_constraints(product, case: RetrievalCase) -> bool:
         return True
     if constraints.category and product.category.casefold() != constraints.category.casefold():
         return True
-    excluded = {brand.casefold() for brand in constraints.excluded_brands}
-    return product.brand.casefold() in excluded
+    excluded = {canonical_brand(brand) for brand in constraints.excluded_brands}
+    from src.data.categories import matches_spec_filters
+    return canonical_brand(product.brand) in excluded or not matches_spec_filters(product.normalized_specs, constraints.spec_filters)
 
 
 def evaluate_retrieval(retriever, cases: list[RetrievalCase]) -> RetrievalEvaluation:
@@ -205,9 +255,34 @@ def evaluate_retrieval(retriever, cases: list[RetrievalCase]) -> RetrievalEvalua
             constraints=case.constraints.model_dump(),
         ))
         returned_ids = {product.product_id for product in result.products}
+        evaluation.returned_products += len(result.products)
+        evaluation.sourced_products += sum(
+            bool(product.provenance.get("price_source", {}).get("url"))
+            and bool(product.provenance.get("price_source", {}).get("collected_at"))
+            and bool(product.provenance.get("spec_sources"))
+            for product in result.products
+        )
         relevant = set(case.relevant_ids)
         retrieved_relevant = returned_ids & relevant
+        if "exact_config" in case.tags:
+            evaluation.exact_cases += 1
+            evaluation.exact_hits += int(bool(retrieved_relevant))
         case_failures: list[str] = []
+        distinct_models = len({p.provenance.get("model_key") or p.product_id for p in result.products})
+        if case.min_distinct_models is not None and distinct_models < case.min_distinct_models:
+            evaluation.diversity_violations += 1
+            case_failures.append("model_diversity")
+        if case.review_product_id is not None:
+            from src.agent.shopping_tools import create_get_reviews
+            from src.data.catalog import load_provenance
+            with sqlite3.connect(Path(retriever.catalog_db).parent / "product_reviews.db") as conn:
+                ids = [row[0] for row in conn.execute("SELECT review_id FROM product_reviews WHERE product_id=? AND aspect=?", (case.review_product_id, case.review_aspect))]
+            provenance = load_provenance(Path(retriever.catalog_db).parent / "product_reviews.db", "review_provenance", ids)
+            observed_summaries = {v["summary_key"] for v in provenance.values()}
+            output = create_get_reviews(str(Path(retriever.catalog_db).parent / "product_reviews.db"), retriever.chroma_dir).invoke({"product_id":case.review_product_id,"aspect":case.review_aspect,"top_k":5})
+            if observed_summaries != set(case.expected_summary_keys) or (observed_summaries and "https://" not in output):
+                evaluation.experience_violations += 1
+                case_failures.append("experience_source_or_scope")
 
         if relevant:
             evaluation.relevant_cases += 1
@@ -245,6 +320,15 @@ def evaluate_retrieval(retriever, cases: list[RetrievalCase]) -> RetrievalEvalua
         if len(met_sources) != len(case.required_sources):
             case_failures.append("required_source_missing")
 
+        evaluation.observations.append({
+            "id": case.id, "tags": case.tags,
+            "returned_ids": [product.product_id for product in result.products],
+            "relevant_ids": sorted(relevant), "hit_ids": sorted(retrieved_relevant),
+            "recall_at_k": round(len(retrieved_relevant) / len(relevant), 4) if relevant else None,
+            "required_sources": case.required_sources, "observed_sources": sorted(observed_sources),
+            "distinct_models": distinct_models,
+        })
+
         if case_failures:
             evaluation.failures.append({
                 "id": case.id,
@@ -258,17 +342,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate the active retrieval index")
     parser.add_argument("--cases", default=None)
     parser.add_argument("--manifest", default=None)
-    parser.add_argument("--dataset-id", default="retrieval-contract-v1")
+    parser.add_argument("--dataset-id", default=REAL_DATASET_ID)
     parser.add_argument("--output-dir", default="evals/results")
     args = parser.parse_args()
 
     from src.config import config
     from src.retrieval.product_retriever import ProductRetriever
 
-    cases_path = Path(args.cases) if args.cases else Path(__file__).with_name("retrieval_cases.jsonl")
-    default_cases = cases_path.resolve() == Path(__file__).with_name("retrieval_cases.jsonl").resolve()
+    bundled_real = REAL_DATASET_DIRECTORY / "retrieval_cases.jsonl"
+    legacy_cases = Path(__file__).with_name("retrieval_cases.jsonl")
+    default_path = bundled_real if args.dataset_id == REAL_DATASET_ID else legacy_cases
+    cases_path = Path(args.cases) if args.cases else default_path
     manifest_path = Path(args.manifest) if args.manifest else (
-        DEFAULT_DATASET_MANIFEST_PATH if default_cases else None
+        REAL_DATASET_DIRECTORY / "manifest.json" if cases_path.resolve() == bundled_real.resolve()
+        else DEFAULT_DATASET_MANIFEST_PATH if cases_path.resolve() == legacy_cases.resolve() else None
     )
     dataset = None
     manifest = None
@@ -287,18 +374,26 @@ def main() -> int:
         return 2
 
     started_at_monotonic, started_at = evaluation_start()
-    preflight = preflight_retrieval(config.PRODUCT_DB_PATH, config.PRODUCT_CHROMA_DIR)
+    preflight = preflight_retrieval(
+        config.PRODUCT_DB_PATH, config.PRODUCT_CHROMA_DIR,
+        expected_catalog_fingerprint=dataset.catalog_fingerprint if dataset else None,
+        embedding_model=config.EMBEDDING_MODEL,
+    )
     metadata = build_run_metadata(
         mode="retrieval",
         started_at_monotonic=started_at_monotonic,
         started_at=started_at,
         dataset=dataset,
         cases_path=cases_path,
-        model="embedding-eval",
+        model=config.EMBEDDING_MODEL,
         provider="local",
         external_access=False,
     )
     metadata["dataset"]["selected_case_count"] = len(cases)
+    metadata["catalog"] = {"dataset_version": dataset.catalog_version if dataset else None,
+                           "fingerprint": dataset.catalog_fingerprint if dataset else None,
+                           "index_version": preflight.index_version,
+                           "embedding_model": config.EMBEDDING_MODEL}
     if not preflight.passed:
         json_path, markdown_path = write_retrieval_reports(
             None,
@@ -313,10 +408,12 @@ def main() -> int:
         )
         return 2
 
+    retriever = None
     try:
         retriever = ProductRetriever(
             chroma_dir=config.PRODUCT_CHROMA_DIR,
             catalog_db=config.PRODUCT_DB_PATH,
+            embedding_model=config.EMBEDDING_MODEL,
         )
         snapshot = evaluate_retrieval(retriever, cases).snapshot()
     except Exception:
@@ -338,6 +435,9 @@ def main() -> int:
             f"reports: {json_path}, {markdown_path}"
         )
         return 2
+    finally:
+        if retriever is not None:
+            retriever.close()
 
     gate_spec = (
         get_quality_gate(manifest, args.dataset_id, "retrieval")

@@ -34,6 +34,9 @@ def _validate_manifest(payload: Any) -> dict[str, Any] | None:
         for name in collections.values()
     ):
         return None
+    fingerprint = payload.get("catalog_fingerprint")
+    if fingerprint is not None and (not isinstance(fingerprint, str) or not re.fullmatch(r"[a-f0-9]{64}", fingerprint)):
+        return None
     return payload
 
 

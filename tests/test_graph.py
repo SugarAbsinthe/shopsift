@@ -124,6 +124,24 @@ class TestExtractProfileSignals:
     def test_reversed_budget_range_is_not_silently_reordered(self):
         assert parse_budget_expression("预算8000到5000") is None
 
+    @pytest.mark.parametrize(("message", "category"), [
+        ("推荐平板电脑", "平板电脑"), ("推荐笔记本电脑", "笔记本电脑"),
+        ("推荐手机", "手机"), ("推荐无线耳机", "无线耳机"),
+    ])
+    def test_four_catalog_categories_are_extracted_without_generic_computer_collision(self, message, category):
+        from src.agent.langgraph_engine import extract_profile_signals
+        store = Mock()
+        extract_profile_signals("test_conv", message, store)
+        matching = [call for call in store.update.call_args_list if call.args[1] == "product_category"]
+        assert matching[0].args[2] == category
+
+    @pytest.mark.parametrize("brand", ["荣耀", "三星", "索尼", "漫步者", "Apple", "HONOR"])
+    def test_catalog_brand_exclusions_are_extracted(self, brand):
+        from src.agent.langgraph_engine import extract_profile_signals
+        store = Mock()
+        extract_profile_signals("test_conv", "排除" + brand, store)
+        assert any(call.args[1] == "exclude_brand" for call in store.update.call_args_list)
+
     @pytest.mark.parametrize(("message", "expected"), [
         ("推荐16-32GB内存的笔记本", None),
         ("预算8000元，内存16-32GB，推荐笔记本", "<=8000"),

@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "dataset_version": "real-catalog-v4-500-models",
+  "status": "complete",
+  "quality_policy": "source-preferred-v1",
+  "capability_status": "trial",
+  "capability_note": "采用单一选定公开来源；未采到的规格保持未知，体验及真实对话仍为试点。",
+  "created_at": "2026-10-15T04:32:05.358435+00:00",
+  "counts": {
+    "products": 549,
+    "reviews": 107,
+    "sources": 902,
+    "unique_summaries": 69,
+    "categories": {
+      "笔记本电脑": {
+        "products": 94,
+        "models": 75,
+        "brands": 11,
+        "covered_models": 8,
+        "experience_coverage": 0.1067
+      },
+      "手机": {
+        "products": 89,
+        "models": 75,
+        "brands": 10,
+        "covered_models": 5,
+        "experience_coverage": 0.0667
+      },
+      "平板电脑": {
+        "products": 83,
+        "models": 70,
+        "brands": 15,
+        "covered_models": 4,
+        "experience_coverage": 0.0571
+      },
+      "无线耳机": {
+        "products": 72,
+        "models": 70,
+        "brands": 14,
+        "covered_models": 4,
+        "experience_coverage": 0.0571
+      },
+      "显示器": {
+        "products": 70,
+        "models": 70,
+        "brands": 47,
+        "covered_models": 0,
+        "experience_coverage": 0.0
+      },
+      "键盘": {
+        "products": 71,
+        "models": 70,
+        "brands": 10,
+        "covered_models": 1,
+        "experience_coverage": 0.0143
+      },
+      "鼠标": {
+        "products": 70,
+        "models": 70,
+        "brands": 35,
+        "covered_models": 3,
+        "experience_coverage": 0.0429
+      }
+    }
+  },
+  "catalog_fingerprint": "9a889f81a02b6adf8bf72055d15cf4698ed7f5364d566ea1d6a25608536aedf9",
+  "price_policy": "人民币公开报价快照，选择一个关联具体配置的来源；目录收录商家报价明确标注，未逐件实时核价，不保证库存或成交价。旧记录保留原采集时间；不使用个人资格补贴。",
+  "experience_policy": "仅保留有具体表现、使用条件或取舍的原始摘要；覆盖缺口明确记录。",
+  "release_readiness": {
+    "policy_id": "seven-categories-500-models-v1",
+    "quality_policy": "source-preferred-v1",
+    "status": "passed",
+    "qualified_models": 500,
+    "configurations": 549,
+    "minimum_models": 500,
+    "issues": []
+  },
+  "files": {
+    "products.jsonl": {
+      "sha256": "2aa6c911a4f15bcd29c205da89061c2768b6bd99cea940a37e3825315cd0002c"
+    },
+    "reviews.jsonl": {
+      "sha256": "3fbbc0e0ea1a58d95b64f1ce06f018a6b62ee4ae3ba1a32eeb8b253e15549261"
+    },
+    "sources.jsonl": {
+      "sha256": "09dcf83b54a8bc45684dd3c200db3d15e9c024b0ebc72f2d08bda030d0c82422"
+    }
+  },
+  "validation": {
+    "checked_on": "2026-10-15",
+    "data_release_gate": "passed",
+    "source_cache": {
+      "sources": 902,
+      "reproducible": 902,
+      "unresolved": 0,
+      "capture_checks": {
+        "archived_response_match": 717,
+        "raw_response_match": 123,
+        "browser_text_match": 21,
+        "LF_restored_match": 41
+      }
+    },
+    "missing_decision_specifications": {
+      "笔记本电脑": 16,
+      "手机": 27,
+      "平板电脑": 50,
+      "无线耳机": 29,
+      "显示器": 43,
+      "键盘": 65,
+      "鼠标": 57
+    },
+    "python": {
+      "passed": 332,
+      "seconds": 50.92
+    },
+    "deterministic_agent": {
+      "passed": 25,
+      "total": 25
+    },
+    "frontend": {
+      "tests_passed": 15,
+      "build": "passed"
+    },
+    "retrieval": {
+      "status": "passed",
+      "cases": 76,
+      "cases_sha256": "603971fb545e8b3ca66fc05c395ab9a66a79f9f9050b2355742fc60b4d86647a",
+      "metrics": {
+        "cases": 76,
+        "diversity_violations": 0,
+        "experience_violations": 0,
+        "hit_rate": 1.0,
+        "recall_at_k": 0.1993,
+        "source_coverage": 1.0,
+        "provenance_coverage": 1.0,
+        "forbidden_violations": 0,
+        "constraint_violations": 0,
+        "empty_result_violations": 0,
+        "exact_cases": 21,
+        "exact_hits": 21,
+        "exact_hit_rate": 1.0,
+        "non_exact_metrics": {
+          "cases": 55,
+          "nonempty_gold_cases": 45,
+          "hit_rate": 1.0,
+          "recall_at_k": 0.1793,
+          "source_coverage": 1.0
+        }
+      }
+    },
+    "live_dialogue": "not_revalidated",
+    "docker": "unavailable"
+  },
+  "category_capabilities": {
+    "笔记本电脑": {
+      "status": "trial",
+      "products": 94,
+      "models": 75,
+      "experience_coverage": 0.1067,
+      "missing_decision_specifications": 16,
+      "gaps": [
+        "体验覆盖不足80%",
+        "真实模型多轮对话本轮未重验",
+        "部分决策规格未知"
+      ]
+    },
+    "手机": {
+      "status": "trial",
+      "products": 89,
+      "models": 75,
+      "experience_coverage": 0.0667,
+      "missing_decision_specifications": 27,
+      "gaps": [
+        "体验覆盖不足80%",
+        "真实模型多轮对话本轮未重验",
+        "部分决策规格未知"
+      ]
+    },
+    "平板电脑": {
+      "status": "trial",
+      "products": 83,
+      "models": 70,
+      "experience_coverage": 0.0571,
+      "missing_decision_specifications": 50,
+      "gaps": [
+        "体验覆盖不足80%",
+        "真实模型多轮对话本轮未重验",
+        "部分决策规格未知"
+      ]
+    },
+    "无线耳机": {
+      "status": "trial",
+      "products": 72,
+      "models": 70,
+      "experience_coverage": 0.0571,
+      "missing_decision_specifications": 29,
+      "gaps": [
+        "体验覆盖不足80%",
+        "真实模型多轮对话本轮未重验",
+        "部分决策规格未知"
+      ]
+    },
+    "显示器": {
+      "status": "trial",
+      "products": 70,
+      "models": 70,
+      "experience_coverage": 0.0,
+      "missing_decision_specifications": 43,
+      "gaps": [
+        "体验覆盖不足80%",
+        "真实模型多轮对话本轮未重验",
+        "部分决策规格未知"
+      ]
+    },
+    "键盘": {
+      "status": "trial",
+      "products": 71,
+      "models": 70,
+      "experience_coverage": 0.0143,
+      "missing_decision_specifications": 65,
+      "gaps": [
+        "体验覆盖不足80%",
+        "真实模型多轮对话本轮未重验",
+        "部分决策规格未知"
+      ]
+    },
+    "鼠标": {
+      "status": "trial",
+      "products": 70,
+      "models": 70,
+      "experience_coverage": 0.0429,
+      "missing_decision_specifications": 57,
+      "gaps": [
+        "体验覆盖不足80%",
+        "真实模型多轮对话本轮未重验",
+        "部分决策规格未知"
+      ]
+    }
+  },
+  "storage_policy": "Fixed catalog directory; Git tracks data history. Collection caches, rejected candidates and run reports are local artifacts."
+}

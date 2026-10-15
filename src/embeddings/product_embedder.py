@@ -12,10 +12,11 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 
 from src.retrieval.index_manifest import activate_index_manifest
+from src.data.catalog import catalog_fingerprint, load_provenance
 
 
 def _rows(db_path: str, query: str) -> list[dict]:
-    conn = sqlite3.connect(f"file:{Path(db_path).resolve()}?mode=ro", uri=True)
+    conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
         return [dict(row) for row in conn.execute(query)]
@@ -51,6 +52,7 @@ def build_product_embeddings(
     if not safe_version or safe_version != version or len(version) > 64:
         raise ValueError("index_version contains unsafe characters")
 
+    content_fingerprint = catalog_fingerprint(products_db, reviews_db)
     embedding_model = model or SentenceTransformer(embedding_model_name)
     chroma_client = client or chromadb.PersistentClient(path=persist_dir)
     names = {
@@ -60,13 +62,9 @@ def build_product_embeddings(
     }
     created: list[str] = []
     try:
-        collections = {}
-        for key, name in names.items():
-            collections[key] = chroma_client.create_collection(name)
-            created.append(name)
-
         products = _rows(products_db, "SELECT * FROM products ORDER BY product_id")
         reviews = _rows(reviews_db, "SELECT * FROM product_reviews ORDER BY review_id")
+        review_sources = load_provenance(reviews_db, "review_provenance", [r["review_id"] for r in reviews])
         specs: list[dict] = []
         for product in products:
             for attribute, value in json.loads(product["specs"]).items():
@@ -95,6 +93,7 @@ def build_product_embeddings(
                             "product_id", "name", "brand", "category", "subcategory",
                             "price", "rating", "sales_count", "release_date",
                         )
+                        if product[key] is not None and product[key] != ""
                     },
                 }
                 for product in products
@@ -108,11 +107,27 @@ def build_product_embeddings(
                         "product_id": review["product_id"],
                         "aspect": review["aspect"],
                         "sentiment": review["sentiment"],
+                        "content": review["content"],
+                        **{key: value for key, value in review_sources.get(review["review_id"], {}).items()
+                           if isinstance(value, (str, int, float, bool))},
                     },
                 }
                 for review in reviews
             ],
         }
+
+        collections = {}
+        for key, name in names.items():
+            # A partial final HNSW batch can remain memory-only even though
+            # SQLite reports the full count. End on a batch/sync boundary so
+            # metadata prefilters can resolve every ID after a process restart.
+            count = len(datasets[key])
+            threshold = next((size for size in range(min(batch_size, count), 2, -1)
+                              if count % size == 0), max(3, count))
+            collections[key] = chroma_client.create_collection(
+                name, metadata={"hnsw:batch_size": threshold, "hnsw:sync_threshold": threshold}
+            )
+            created.append(name)
 
         for key, records in datasets.items():
             collection = collections[key]
@@ -135,7 +150,10 @@ def build_product_embeddings(
             "collections": names,
             "counts": {key: len(records) for key, records in datasets.items()},
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "catalog_fingerprint": content_fingerprint,
         }
+        if catalog_fingerprint(products_db, reviews_db) != content_fingerprint:
+            raise RuntimeError("catalog changed during index construction")
         activate_index_manifest(persist_dir, manifest)
         return manifest
     except Exception:

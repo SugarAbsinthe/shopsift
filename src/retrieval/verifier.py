@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 
-from src.retrieval.models import RetrievalConstraints, RetrievalResult, VerificationResult
+from src.retrieval.models import RetrievalConstraints, RetrievalResult, VerificationResult, canonical_brand
+from src.data.categories import matches_spec_filters
 
 
 _PRODUCT_ID_RE = re.compile(
@@ -16,6 +17,13 @@ _PRICE_RE = re.compile(
     r"(?P<amount>\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)"
     r"\s*(?P<unit>元|人民币|块)?"
 )
+_SOURCE_URL_RE = re.compile(r"https?://[^\s<>()\[\]`\"'，。；）]+", re.I)
+
+
+def _without_source_urls(answer: str) -> str:
+    # Merchant API product_id/price query parameters identify source records,
+    # not catalog assertions. Preserve offsets for local-clause price pairing.
+    return _SOURCE_URL_RE.sub(lambda match: " " * len(match.group()), answer)
 
 
 def _explicit_prices(answer: str) -> list[tuple[int, int, float]]:
@@ -29,6 +37,7 @@ def _explicit_prices(answer: str) -> list[tuple[int, int, float]]:
 
 
 def _product_price_pairs(answer: str) -> list[tuple[int, float]]:
+    answer = _without_source_urls(answer)
     ids = list(_PRODUCT_ID_RE.finditer(answer))
     prices = _explicit_prices(answer)
     if not ids or not prices:
@@ -60,8 +69,8 @@ def _matches_constraints(product, constraints: RetrievalConstraints) -> bool:
         return False
     if constraints.category and product.category.casefold() != constraints.category.casefold():
         return False
-    excluded = {brand.casefold() for brand in constraints.excluded_brands}
-    return product.brand.casefold() not in excluded
+    excluded = {canonical_brand(brand) for brand in constraints.excluded_brands}
+    return canonical_brand(product.brand) not in excluded and matches_spec_filters(product.normalized_specs, constraints.spec_filters)
 
 
 def verify_answer(answer: str, retrieval_result: RetrievalResult | dict | None) -> VerificationResult:
@@ -82,7 +91,8 @@ def verify_answer(answer: str, retrieval_result: RetrievalResult | dict | None) 
     evidence_by_key = {
         (item.product_id, item.field): item for item in retrieval_result.evidence
     }
-    mentioned_ids = list(dict.fromkeys(int(match.group(1)) for match in _PRODUCT_ID_RE.finditer(answer)))
+    fact_text = _without_source_urls(answer)
+    mentioned_ids = list(dict.fromkeys(int(match.group(1)) for match in _PRODUCT_ID_RE.finditer(fact_text)))
     failures: list[str] = []
     evidence_ids: list[str] = []
 

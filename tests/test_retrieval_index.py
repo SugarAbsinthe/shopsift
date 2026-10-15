@@ -2,6 +2,9 @@
 
 import json
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +24,45 @@ class FakeVector:
         return self.value
 
 
+@pytest.mark.parametrize('size', (3, 67, 69))
+def test_small_persistent_index_can_be_queried_after_builder_process_exits(tmp_path, size):
+    products, reviews = _databases(tmp_path)
+    # Also cover a prime count and a partial encoder batch. Count checks alone
+    # cannot detect metadata IDs absent from the persisted HNSW segment.
+    with sqlite3.connect(products) as conn:
+        for identifier in range(2, size + 1):
+            conn.execute("INSERT INTO products SELECT ?, name, brand, category, subcategory, price, rating, sales_count, release_date, description, specs FROM products WHERE product_id=1", (identifier,))
+    with sqlite3.connect(reviews) as conn:
+        for identifier in range(2, size + 1):
+            conn.execute("INSERT INTO product_reviews SELECT ?, ?, sentiment, aspect, content FROM product_reviews WHERE review_id=1", (identifier, identifier))
+    persist = str(tmp_path / "persistent")
+    build = """
+import sys
+import numpy as np
+from src.embeddings.product_embedder import build_product_embeddings
+class Model:
+    def encode(self, documents):
+        return np.array([[1.0, 0.5] for _ in documents])
+build_product_embeddings(*sys.argv[1:], 'local-test', model=Model())
+"""
+    query = """
+import sys
+import chromadb
+from src.retrieval.index_manifest import load_index_manifest
+manifest = load_index_manifest(sys.argv[1])
+client = chromadb.PersistentClient(path=sys.argv[1])
+for name in manifest['collections'].values():
+    size = int(sys.argv[2])
+    result = client.get_collection(name).query(query_embeddings=[[1.0, 0.5]], n_results=3,
+        where={'product_id':{'$in':list(range(size-2,size+1))}})
+    assert len(result['ids'][0]) == 3
+"""
+    root = Path(__file__).resolve().parents[1]
+    for script, arguments in ((build, [products, reviews, persist]), (query, [persist, str(size)])):
+        result = subprocess.run([sys.executable, "-c", script, *arguments], cwd=root, capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr
+
+
 class FakeModel:
     def encode(self, documents):
         return [FakeVector([float(index), 0.5]) for index, _ in enumerate(documents)]
@@ -30,9 +72,11 @@ class FakeBuildCollection:
     def __init__(self, fail_count=False):
         self.total = 0
         self.fail_count = fail_count
+        self.metadata = []
 
     def add(self, **kwargs):
         self.total += len(kwargs["ids"])
+        self.metadata.extend(kwargs["metadatas"])
 
     def count(self):
         return self.total + (1 if self.fail_count else 0)
@@ -44,7 +88,7 @@ class FakeBuildClient:
         self.collections = {}
         self.deleted = []
 
-    def create_collection(self, name):
+    def create_collection(self, name, **kwargs):
         collection = FakeBuildCollection(name == self.fail_name)
         self.collections[name] = collection
         return collection
@@ -152,3 +196,16 @@ def test_successful_build_activates_validated_counts(tmp_path):
     )
     assert manifest["counts"] == {"descriptions": 1, "specs": 1, "reviews": 1}
     assert load_index_manifest(persist)["version"] == "v2"
+
+
+@pytest.mark.parametrize("release_date", [None, ""])
+def test_unknown_metadata_is_omitted_and_content_hash_is_recorded(tmp_path, release_date):
+    products, reviews = _databases(tmp_path)
+    with sqlite3.connect(products) as conn:
+        conn.execute("UPDATE products SET rating=NULL, sales_count=NULL, release_date=?", (release_date,))
+    client = FakeBuildClient()
+    manifest = build_product_embeddings(products, reviews, str(tmp_path / "chroma"), "fake-model",
+        index_version="unknowns", model=FakeModel(), client=client)
+    metadata = client.collections[manifest["collections"]["descriptions"]].metadata[0]
+    assert not any(field in metadata for field in ("rating", "sales_count", "release_date"))
+    assert len(manifest["catalog_fingerprint"]) == 64

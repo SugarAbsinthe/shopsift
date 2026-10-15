@@ -295,7 +295,8 @@ class ToolGateway:
 
             counts[name] = counts.get(name, 0) + 1
             self._audit(tool=name, decision="allow", reason="policy_pass", stage=stage, access=spec.access)
-            result, error = self._invoke_with_timeout(tool, args, spec.timeout_ms)
+            invocation = {"type": "tool_call", "name": name, "id": call_id, "args": args} if getattr(tool, "response_format", "") == "content_and_artifact" else args
+            result, error = self._invoke_with_timeout(tool, invocation, spec.timeout_ms)
             if error == "timeout":
                 mark_timeout("tool", "timeout")
                 self._audit(tool=name, decision="timeout", reason="timeout", stage=stage, access=spec.access)
@@ -311,7 +312,8 @@ class ToolGateway:
             else:
                 messages.append(
                     ToolMessage(
-                        content=str(result) if result is not None else "",
+                        content=result.content if isinstance(result, ToolMessage) else str(result) if result is not None else "",
+                        artifact=result.artifact if isinstance(result, ToolMessage) else None,
                         tool_call_id=call_id,
                         name=name,
                         status="success",

@@ -21,11 +21,14 @@ from src.retrieval.models import (
     RetrievalQuery,
     RetrievalResult,
     RetrievalStats,
+    canonical_brand,
 )
-from src.retrieval.index_manifest import resolve_collection_names
+from src.retrieval.index_manifest import resolve_collection_names, load_index_manifest
+from src.data.catalog import load_provenance, value_or_unknown, format_product_sources, format_review_source, catalog_fingerprint
+from src.data.categories import matches_spec_filters, explicit_spec_filters, catalog_filter_specs
 
 
-RETRIEVAL_ALGORITHM_VERSION = "hybrid-rrf-v3-threadsafe-sparse"
+RETRIEVAL_ALGORITHM_VERSION = "hybrid-rrf-v8-negation-profile-refinements"
 RRF_K = 60
 
 
@@ -60,6 +63,12 @@ class ProductRetriever:
         model=None,
         client=None,
     ):
+        self.chroma_dir = chroma_dir
+        active = load_index_manifest(chroma_dir)
+        if active and active.get("catalog_fingerprint") and catalog_db:
+            products_path = Path(catalog_db)
+            if catalog_fingerprint(products_path, products_path.parent / "product_reviews.db") != active["catalog_fingerprint"]:
+                raise ValueError("Catalog content changed; explicitly rebuild the index with --rebuild-index.")
         self.model = model or SentenceTransformer(embedding_model)
         self.client = client or chromadb.PersistentClient(path=chroma_dir)
         collection_names, self.index_version = resolve_collection_names(chroma_dir)
@@ -133,16 +142,18 @@ class ProductRetriever:
         return product_ids
 
     def _vector_recall(
-        self, collection, query_embedding: list[float], limit: int
+        self, collection, query_embedding: list[float], limit: int, eligible_ids: list[int] | None = None
     ) -> list[int]:
+        extra = {"where": {"product_id": {"$in": eligible_ids}}} if eligible_ids is not None else {}
         results = collection.query(
             query_embeddings=[query_embedding],
             n_results=limit,
             include=["metadatas"],
+            **extra,
         )
         return self._metadata_ids(results)
 
-    def _sparse_recall(self, query: str, limit: int) -> tuple[list[int], bool]:
+    def _sparse_recall(self, query: str, limit: int, eligible_ids: list[int] | None = None) -> tuple[list[int], bool]:
         if not self._sparse_available or self._sparse_conn is None:
             return [], True
         user_query = query.splitlines()[0]
@@ -163,10 +174,16 @@ class ProductRetriever:
             with self._sparse_lock:
                 if self._sparse_conn is None:
                     return [], True
+                restriction = ""
+                params = [expression]
+                if eligible_ids is not None:
+                    restriction = " AND product_id IN (" + ",".join("?" for _ in eligible_ids) + ")"
+                    params.extend(eligible_ids)
+                params.append(limit)
                 rows = self._sparse_conn.execute(
                     "SELECT product_id FROM product_fts WHERE searchable MATCH ? "
-                    "ORDER BY bm25(product_fts) LIMIT ?",
-                    (expression, limit),
+                    + restriction + " ORDER BY bm25(product_fts) LIMIT ?",
+                    params,
                 ).fetchall()
             return [int(row[0]) for row in rows], False
         except sqlite3.Error:
@@ -199,6 +216,7 @@ class ProductRetriever:
         except (OSError, sqlite3.Error):
             return {}
 
+        provenance = load_provenance(self.catalog_db, "product_provenance", product_ids)
         products: dict[int, ProductCandidate] = {}
         for row in rows:
             try:
@@ -217,6 +235,8 @@ class ProductRetriever:
                 release_date=row["release_date"] or "",
                 description=row["description"] or "",
                 specs=specs,
+                provenance=provenance.get(row["product_id"], {}),
+                normalized_specs=catalog_filter_specs(row["category"], specs, provenance.get(row["product_id"], {}).get("normalized_specs", {})),
             )
             products[product.product_id] = product
         return products
@@ -225,6 +245,8 @@ class ProductRetriever:
     def _matches_constraints(
         product: ProductCandidate, constraints: RetrievalConstraints
     ) -> bool:
+        if product.provenance.get("availability") == "out_of_stock":
+            return False
         if constraints.min_price is not None and (
             product.price is None or product.price < constraints.min_price
         ):
@@ -235,10 +257,10 @@ class ProductRetriever:
             return False
         if constraints.category and product.category.casefold() != constraints.category.casefold():
             return False
-        excluded = {brand.casefold() for brand in constraints.excluded_brands}
-        if product.brand.casefold() in excluded:
+        excluded = {canonical_brand(brand) for brand in constraints.excluded_brands}
+        if canonical_brand(product.brand) in excluded:
             return False
-        return True
+        return matches_spec_filters(product.normalized_specs, constraints.spec_filters)
 
     @staticmethod
     def _rerank_bonus(
@@ -258,8 +280,8 @@ class ProductRetriever:
         ]
         if any(re.sub(r"\s+", "", term) in searchable_specs for term in compact_terms):
             bonus += 0.01
-        preferred = {brand.casefold() for brand in constraints.preferred_brands}
-        if product.brand.casefold() in preferred:
+        preferred = {canonical_brand(brand) for brand in constraints.preferred_brands}
+        if canonical_brand(product.brand) in preferred:
             bonus += 0.005
         return bonus
 
@@ -288,7 +310,10 @@ class ProductRetriever:
             reviews[product_id].append({
                 "aspect": str(metadata.get("aspect", "")),
                 "sentiment": str(metadata.get("sentiment", "")),
-                "content": str(document),
+                "content": str(metadata.get("content", document)),
+                **{key: str(metadata[key]) for key in (
+                    "source_url", "source_title", "source_type", "collected_at", "scope", "model_key", "summary_key",
+                ) if metadata.get(key) is not None},
             })
         return dict(reviews)
 
@@ -303,11 +328,42 @@ class ProductRetriever:
         request = query if isinstance(query, RetrievalQuery) else RetrievalQuery(
             text=query, top_k=top_k, constraints=filters or {}
         )
+        from src.retrieval.models import SpecFilter
+        predicates = {(p.field, p.op): p for p in request.constraints.spec_filters}
+        user_text = request.text.split("\n用户画像:", 1)[0]
+        explicit_fields = {p.field for p in request.constraints.spec_filters}
+        for predicate in explicit_spec_filters(user_text, request.constraints.category):
+            if predicate["field"] not in explicit_fields:
+                predicates[predicate["field"], predicate["op"]] = SpecFilter.model_validate(predicate)
+        request.constraints.spec_filters = list(predicates.values())
+        eligible_ids = None
+        pool = {}
+        exact = []
+        if self.catalog_db and Path(self.catalog_db).is_file():
+            with closing(sqlite3.connect(Path(self.catalog_db).resolve().as_uri() + "?mode=ro", uri=True)) as catalog:
+                identifiers = [int(r[0]) for r in catalog.execute("SELECT product_id FROM products").fetchall()]
+            pool = self._load_catalog_products(identifiers)
+            exact = [p.product_id for p in pool.values() if p.name.casefold() in user_text.casefold()]
+            if len(exact) == 1 and re.search(r"只(?:查询|看|要|买)|体验|评测|评价|参数|规格|价格|有没有|是否", user_text):
+                pool = {exact[0]: pool[exact[0]]}
+            elif len(exact)>1 and re.search(r"对比|比较|对照",user_text):
+                pool = {pid:pool[pid] for pid in exact}
+            eligible_ids = [pid for pid, p in pool.items() if self._matches_constraints(p, request.constraints)]
+            if not eligible_ids:
+                return RetrievalResult(constraints=request.constraints, stats=RetrievalStats(index_version=self.index_version, filtered_candidates=len(identifiers), duration_ms=round((time.perf_counter()-started)*1000)))
         overfetch = min(request.top_k * 3, 60)
         query_embedding = self.model.encode(request.text).tolist()
-        description_ids = self._vector_recall(self.desc_col, query_embedding, overfetch)
-        spec_ids = self._vector_recall(self.spec_col, query_embedding, overfetch)
-        sparse_ids, sparse_fallback = self._sparse_recall(request.text, overfetch)
+        recall_args = (eligible_ids,) if eligible_ids is not None else ()
+        description_ids = self._vector_recall(self.desc_col, query_embedding, overfetch, *recall_args)
+        if eligible_ids and not exact and not re.search(r"对比|比较|对照",user_text):
+            model_key=lambda pid: pool[pid].provenance.get('model_key') or str(pid)
+            required_models=min(3,request.top_k,len({model_key(pid) for pid in eligible_ids}))
+            limit=overfetch
+            while len({model_key(pid) for pid in description_ids if pid in pool})<required_models and limit<len(eligible_ids):
+                limit=min(limit*2,len(eligible_ids))
+                description_ids=self._vector_recall(self.desc_col,query_embedding,limit,*recall_args)
+        spec_ids = self._vector_recall(self.spec_col, query_embedding, overfetch, *recall_args)
+        sparse_ids, sparse_fallback = self._sparse_recall(request.text, overfetch, *recall_args)
 
         ranked_ids = {
             "description": description_ids,
@@ -332,7 +388,17 @@ class ProductRetriever:
             candidates.append(product)
 
         candidates.sort(key=lambda item: (-item.score, item.product_id))
-        products = candidates[: request.top_k]
+        if "对比" in request.text or any(re.sub(r"\s+", "", p.name).casefold() in re.sub(r"\s+", "", request.text).casefold() for p in candidates):
+            products = candidates[: request.top_k]
+        else:
+            first, variants, seen_models = [], [], set()
+            for p in candidates:
+                model_key = p.provenance.get("model_key") or str(p.product_id)
+                if model_key in seen_models:
+                    variants.append(p)
+                else:
+                    first.append(p); seen_models.add(model_key)
+            products = (first + variants)[: request.top_k]
         product_ids = [product.product_id for product in products]
         reviews = self._retrieve_reviews(query_embedding, product_ids, request.top_k)
         stats = RetrievalStats(
@@ -450,22 +516,33 @@ class ProductRetriever:
                 f"{product.category or '?'} / {product.subcategory or '?'}"
             )
             lines.append(
-                f"- 价格: RMB{product.price if product.price is not None else '?'} | "
-                f"评分: {product.rating if product.rating is not None else '?'} 分 | "
-                f"销量: {product.sales_count or 0}"
+                f"- 价格: RMB{value_or_unknown(product.price)} | "
+                f"评分: {value_or_unknown(product.rating)} | "
+                f"销量: {value_or_unknown(product.sales_count)}"
             )
             lines.append(
-                f"- 发布日期: {product.release_date or '?'} | 产品ID: {product.product_id}"
+                f"- 发布日期: {value_or_unknown(product.release_date)} | 产品ID: {product.product_id}"
             )
-            if product.description:
+            provenance_text = format_product_sources(product.provenance)
+            if provenance_text:
+                lines.append(provenance_text)
+            from src.data.categories import REQUIRED
+            redundant_description = bool(product.normalized_specs) and all(
+                f"{key}：{product.specs[key]}" in product.description
+                for key in REQUIRED.get(product.category, ()) if key in product.specs
+            )
+            if product.description and not redundant_description:
                 lines.append(f"- 产品简介: {product.description}")
             if product.specs:
                 lines.append("- 规格参数:")
                 lines.extend(f"  {key}: {value}" for key, value in product.specs.items())
             if product.product_id in reviews_by_pid:
-                lines.append("- 用户评价摘要:")
+                lines.append("- 有来源的体验摘要（个别来源观点）:")
                 for review in reviews_by_pid[product.product_id][:3]:
-                    marker = "+" if review["sentiment"] == "positive" else "-"
+                    marker = {"positive": "+", "negative": "-", "neutral": "中性", "mixed": "褒贬并存"}.get(review["sentiment"], "未知")
                     lines.append(f"  [{marker}] {review['aspect']}: {review['content']}")
+                    lines.append("  " + format_review_source(review))
+            elif product.provenance:
+                lines.append("- 体验资料: 暂无可核验摘要")
             lines.append("")
         return "\n".join(lines)

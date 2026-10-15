@@ -83,7 +83,8 @@ def get_conv_store():
     global _conv_store
     if _conv_store is None:
         from src.db.conversation_store import ConversationStore
-        db_path = str(BASE_DIR / "data" / "conversations.db")
+        from src.config import config
+        db_path = config.CONV_DB_PATH
         _conv_store = ConversationStore(db_path)
         logger.info("ConversationStore initialized at %s", db_path)
     return _conv_store
