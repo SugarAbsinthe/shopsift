@@ -31,7 +31,7 @@ Token 预算依赖服务商返回的用量；时间和取消检查是协作式�
 
 ## 数据与索引
 
-固定目录 [`datasets/real_catalog/`](datasets/real_catalog/README.md) 包含500个不同型号、549条配置、107条体验适用关联及69个独立摘要。直接更新该目录，历史交由Git管理；清单保留数据批次与指纹，用于核对JSONL、SQLite和Chroma。七类均衡扩充，价格为人民币快照，缺失规格保持未知。数据规模与品牌分布门禁通过，体验和真实多轮对话仍为试点，详见[目录说明](datasets/real_catalog/README.md)及[验收标准](data_acceptance_criteria.md)。数据库、索引、采集缓存和过程报告均为本地产物。
+固定目录 [`datasets/real_catalog/`](datasets/real_catalog/README.md) 包含500个不同型号、549条配置、107条体验适用关联及69个独立摘要。直接更新该目录，历史交由Git管理；清单保留数据批次与指纹，用于核对JSONL、SQLite和Chroma。价格为人民币快照，缺失规格保持未知；体验和真实多轮对话仍为试点，详见[目录说明](datasets/real_catalog/README.md)。数据库、索引、采集缓存和过程报告均为本地产物。
 ```bash
 # 不需要 API 密钥、联网或嵌入模型
 python -m src.data.prepare_catalog --validate-only
@@ -104,11 +104,11 @@ python -m evals.retrieval_runner --dataset-id retrieval-contract-v1 --manifest e
 python -m evals.catalog_smoke
 ```
 
-原契约集的 ID 与真实目录不同，需匹配其原始目录，不能将它在真实目录上的分数作为本轮质量指标。`catalog_smoke` 使用真实 SQLite、Chroma、只读工具和 Agent 图，配合受控本地模型验证七类推荐/对比/体验流程及中文品牌排除，不评估远程模型回答质量。
+原契约集的 ID 与真实目录不同，需匹配其原始目录，不能将它在真实目录上的分数作为目录质量指标。`catalog_smoke` 使用真实 SQLite、Chroma、只读工具和 Agent 图，配合受控本地模型验证七类推荐/对比/体验流程及中文品牌排除，不评估远程模型回答质量。
 
 运行前确认商品库具有 `products` 表，Chroma 目录存在活动描述 / 规格 / 评价集合，版本化索引的清单完整，嵌入模型与索引兼容。旧集合名为 `product_descriptions`、`product_specs` 和 `product_reviews`；版本化集合按活动清单解析。
 
-前置检查在加载嵌入模型之前执行。缺少数据库/索引、目录与标注或索引指纹不一致、嵌入模型不匹配时报告 `blocked`、退出码 `2`，质量指标不记为零。真实集门禁要求21条精确配置全部命中、商品来源完整，结构化硬条件、禁入及空结果违规为零；其余案例报告实际表现及诊断，详见[本版验收结果](datasets/real_catalog/README.md)。25条确定性Agent案例保留独立门禁。
+前置检查在加载嵌入模型之前执行。缺少数据库/索引、目录与标注或索引指纹不一致、嵌入模型不匹配时报告 `blocked`、退出码 `2`，质量指标不记为零。真实集门禁要求21条精确配置全部命中、商品来源完整，结构化硬条件、禁入及空结果违规为零；其余案例在本地报告中记录实际表现及诊断。25条确定性Agent案例保留独立门禁。
 
 真实服务场景使用 `python -m evals.catalog_smoke --live --output-dir evals/results/catalog-live`，调用配置中的真实模型，经FastAPI聊天接口验证三新品类各三个六轮场景；画像、会话与Checkpoint隔离到报告目录。检查推荐、追加硬条件、排除及撤销品牌、对比与体验工具、未知或空结果，并保存各轮结构化条件。受控模型测试不能替代这项，真实回答仍须人工复核；Docker须在具备Docker的环境验收。
 
@@ -170,4 +170,4 @@ docker compose up --build
 
 已有索引不会因数据库内容变化而自动重建；上述命令使用运行时配置中的商品路径、Chroma 路径和嵌入模型，评价库位于商品库同目录的 `product_reviews.db`。自定义容器路径必须位于实际挂载的目录内；不要直接把宿主机的绝对路径填入容器配置。
 
-当前开发环境未安装 Docker，已通过本地初始化回归、前端代理与构建检查；尚未完成真实容器镜像构建、首次权重下载和完整对话验收。
+Docker镜像构建、容器内首次权重下载和完整对话仍需在实际运行环境验证；HTTP健康检查不能替代这些检查。

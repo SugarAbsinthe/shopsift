@@ -86,71 +86,6 @@
       "sha256": "09dcf83b54a8bc45684dd3c200db3d15e9c024b0ebc72f2d08bda030d0c82422"
     }
   },
-  "validation": {
-    "checked_on": "2026-10-15",
-    "data_release_gate": "passed",
-    "source_cache": {
-      "sources": 902,
-      "reproducible": 902,
-      "unresolved": 0,
-      "capture_checks": {
-        "archived_response_match": 717,
-        "raw_response_match": 123,
-        "browser_text_match": 21,
-        "LF_restored_match": 41
-      }
-    },
-    "missing_decision_specifications": {
-      "笔记本电脑": 16,
-      "手机": 27,
-      "平板电脑": 50,
-      "无线耳机": 29,
-      "显示器": 43,
-      "键盘": 65,
-      "鼠标": 57
-    },
-    "python": {
-      "passed": 332,
-      "seconds": 50.92
-    },
-    "deterministic_agent": {
-      "passed": 25,
-      "total": 25
-    },
-    "frontend": {
-      "tests_passed": 15,
-      "build": "passed"
-    },
-    "retrieval": {
-      "status": "passed",
-      "cases": 76,
-      "cases_sha256": "603971fb545e8b3ca66fc05c395ab9a66a79f9f9050b2355742fc60b4d86647a",
-      "metrics": {
-        "cases": 76,
-        "diversity_violations": 0,
-        "experience_violations": 0,
-        "hit_rate": 1.0,
-        "recall_at_k": 0.1993,
-        "source_coverage": 1.0,
-        "provenance_coverage": 1.0,
-        "forbidden_violations": 0,
-        "constraint_violations": 0,
-        "empty_result_violations": 0,
-        "exact_cases": 21,
-        "exact_hits": 21,
-        "exact_hit_rate": 1.0,
-        "non_exact_metrics": {
-          "cases": 55,
-          "nonempty_gold_cases": 45,
-          "hit_rate": 1.0,
-          "recall_at_k": 0.1793,
-          "source_coverage": 1.0
-        }
-      }
-    },
-    "live_dialogue": "not_revalidated",
-    "docker": "unavailable"
-  },
   "category_capabilities": {
     "笔记本电脑": {
       "status": "trial",
@@ -160,7 +95,7 @@
       "missing_decision_specifications": 16,
       "gaps": [
         "体验覆盖不足80%",
-        "真实模型多轮对话本轮未重验",
+        "真实模型多轮对话能力尚未完成正式验收",
         "部分决策规格未知"
       ]
     },
@@ -172,7 +107,7 @@
       "missing_decision_specifications": 27,
       "gaps": [
         "体验覆盖不足80%",
-        "真实模型多轮对话本轮未重验",
+        "真实模型多轮对话能力尚未完成正式验收",
         "部分决策规格未知"
       ]
     },
@@ -184,7 +119,7 @@
       "missing_decision_specifications": 50,
       "gaps": [
         "体验覆盖不足80%",
-        "真实模型多轮对话本轮未重验",
+        "真实模型多轮对话能力尚未完成正式验收",
         "部分决策规格未知"
       ]
     },
@@ -196,7 +131,7 @@
       "missing_decision_specifications": 29,
       "gaps": [
         "体验覆盖不足80%",
-        "真实模型多轮对话本轮未重验",
+        "真实模型多轮对话能力尚未完成正式验收",
         "部分决策规格未知"
       ]
     },
@@ -208,7 +143,7 @@
       "missing_decision_specifications": 43,
       "gaps": [
         "体验覆盖不足80%",
-        "真实模型多轮对话本轮未重验",
+        "真实模型多轮对话能力尚未完成正式验收",
         "部分决策规格未知"
       ]
     },
@@ -220,7 +155,7 @@
       "missing_decision_specifications": 65,
       "gaps": [
         "体验覆盖不足80%",
-        "真实模型多轮对话本轮未重验",
+        "真实模型多轮对话能力尚未完成正式验收",
         "部分决策规格未知"
       ]
     },
@@ -232,7 +167,7 @@
       "missing_decision_specifications": 57,
       "gaps": [
         "体验覆盖不足80%",
-        "真实模型多轮对话本轮未重验",
+        "真实模型多轮对话能力尚未完成正式验收",
         "部分决策规格未知"
       ]
     }

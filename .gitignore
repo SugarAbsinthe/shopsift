@@ -2,6 +2,7 @@
 .env
 
 # ---- Private docs ----
+/data_acceptance_criteria.md
 QA.md
 jianli.md
 docs/
