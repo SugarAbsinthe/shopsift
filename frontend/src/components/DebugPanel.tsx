@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { X } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 interface DebugPanelProps {
   stage: string;
@@ -86,7 +88,9 @@ export default function DebugPanel({
         )}
         {activeTab === "products" && (
           productContext ? (
-            <div className="markdown-body text-xs" dangerouslySetInnerHTML={{ __html: productContext }} />
+            <div className="markdown-body text-xs">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{productContext}</ReactMarkdown>
+            </div>
           ) : (
             <p className="text-xs text-slate-400">本轮未触发产品检索</p>
           )

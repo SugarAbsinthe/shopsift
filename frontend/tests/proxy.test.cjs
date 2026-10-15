@@ -36,13 +36,17 @@ test("configured proxy forwards REST and SSE before stream completion", { timeou
   const previous = process.env.API_PROXY_TARGET;
   process.env.API_PROXY_TARGET = `http://127.0.0.1:${backend.address().port}`;
   let frontend;
+  let proxyServer;
   try {
     frontend = await createServer({
       root, logLevel: "silent",
-      server: { host: "127.0.0.1", port: 0, strictPort: true, watch: null },
+      server: { middlewareMode: true, hmr: false, watch: null },
     });
-    await frontend.listen();
-    const base = `http://127.0.0.1:${frontend.httpServer.address().port}`;
+    // Vite can resolve port 0 back to 5173. Bind the middleware host directly
+    // to an OS-assigned port so this test can run alongside a development app.
+    proxyServer = http.createServer(frontend.middlewares);
+    await new Promise((resolve) => proxyServer.listen(0, "127.0.0.1", resolve));
+    const base = `http://127.0.0.1:${proxyServer.address().port}`;
     const response = await fetch(`${base}/api/conversations`);
     assert.deepEqual(await response.json(), { path: "/api/conversations" });
 
@@ -63,6 +67,10 @@ test("configured proxy forwards REST and SSE before stream completion", { timeou
     assert.match(remaining, /event: done/);
   } finally {
     finishStream?.();
+    if (proxyServer?.listening) {
+      proxyServer.closeAllConnections();
+      await new Promise((resolve) => proxyServer.close(resolve));
+    }
     if (frontend) await frontend.close();
     backend.closeAllConnections();
     await new Promise((resolve) => backend.close(resolve));

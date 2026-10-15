@@ -16,10 +16,10 @@ interface ChatAreaProps {
 }
 
 const QUICK_CHIPS = [
-  "预算8000左右，主要打游戏，偶尔出差",
-  "我是设计专业学生，推荐什么笔记本？",
-  "联想和惠普的游戏本哪个好？",
-  "想买个适合编程的轻薄本，续航要好",
+  "预算8000元，办公和编程，推荐笔记本",
+  "预算4000元，推荐256GB存储的手机",
+  "预算3500元，推荐上课和看视频的平板电脑",
+  "预算400元，推荐通勤用的无线耳机",
 ];
 
 export default function ChatArea({
@@ -30,7 +30,26 @@ export default function ChatArea({
   showQuickChips = true,
 }: ChatAreaProps) {
   const [input, setInput] = useState("");
+  const [quickChips, setQuickChips] = useState(QUICK_CHIPS);
+  const [catalogHint, setCatalogHint] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch("/api/catalog/categories", { signal: controller.signal })
+      .then((response) => response.ok ? response.json() : null)
+      .then((data) => {
+        if (!controller.signal.aborted && data?.categories?.length) {
+          setQuickChips(data.categories.map((category: { example: string }) => category.example));
+          if (data.categories.some((category: { status: string }) => category.status === "trial")) {
+            setCatalogHint("目录处于试点阶段，价格为采集时快照；部分商品缺少体验资料。");
+          }
+        } else if (data?.available === false) {
+          setQuickChips([]);
+        }
+      }).catch(() => {});
+    return () => controller.abort();
+  }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -62,8 +81,9 @@ export default function ChatArea({
             </div>
             <h2 className="text-lg font-semibold text-slate-700 mb-1">需要我帮你找什么？</h2>
             <p className="text-sm text-slate-400 mb-6">告诉我你的需求和预算，我帮你找到最合适的</p>
+            {catalogHint && <p className="text-xs text-slate-400 mb-4">{catalogHint}</p>}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-              {QUICK_CHIPS.map((chip, i) => (
+              {quickChips.map((chip, i) => (
                 <button
                   key={i}
                   onClick={() => onSend(chip)}
