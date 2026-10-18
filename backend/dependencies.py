@@ -156,8 +156,11 @@ def get_component_status() -> dict:
     try:
         import chromadb
         from src.config import config
+        from src.retrieval.index_manifest import resolve_collection_names
         client = chromadb.PersistentClient(path=config.PRODUCT_CHROMA_DIR)
-        client.get_collection("product_descriptions")
+        collections, _ = resolve_collection_names(config.PRODUCT_CHROMA_DIR)
+        for collection in collections.values():
+            client.get_collection(collection)
         status["chromadb"] = True
     except Exception:
         pass

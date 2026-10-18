@@ -10,6 +10,7 @@ interface DisplayMessage {
 interface ChatAreaProps {
   messages: DisplayMessage[];
   isLoading: boolean;
+  status?: string | null;
   onSend: (question: string) => void;
   onCancel?: () => void;
   showQuickChips?: boolean;
@@ -18,13 +19,12 @@ interface ChatAreaProps {
 const QUICK_CHIPS = [
   "预算8000元，办公和编程，推荐笔记本",
   "预算4000元，推荐256GB存储的手机",
-  "预算3500元，推荐上课和看视频的平板电脑",
-  "预算400元，推荐通勤用的无线耳机",
 ];
 
 export default function ChatArea({
   messages,
   isLoading,
+  status,
   onSend,
   onCancel,
   showQuickChips = true,
@@ -40,11 +40,11 @@ export default function ChatArea({
       .then((response) => response.ok ? response.json() : null)
       .then((data) => {
         if (!controller.signal.aborted && data?.categories?.length) {
-          setQuickChips(data.categories.map((category: { example: string }) => category.example));
+          setQuickChips(data.categories.slice(0, 2).map((category: { example: string }) => category.example));
           if (data.categories.some((category: { status: string }) => category.status === "trial")) {
             setCatalogHint("目录处于试点阶段，价格为采集时快照；部分商品缺少体验资料。");
           }
-        } else if (data?.available === false) {
+        } else if (!controller.signal.aborted && data?.available === false) {
           setQuickChips([]);
         }
       }).catch(() => {});
@@ -62,7 +62,7 @@ export default function ChatArea({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       handleSubmit();
     }
@@ -74,7 +74,7 @@ export default function ChatArea({
     <div className="flex flex-col h-full">
       {/* Messages area */}
       <div className={`flex-1 overflow-y-auto ${isEmpty ? "flex items-center justify-center" : "px-4 py-5"}`}>
-        {isEmpty && showQuickChips ? (
+        {isEmpty && showQuickChips && !isLoading ? (
           <div className="w-full max-w-xl mx-auto text-center px-6">
             <div className="w-14 h-14 rounded-2xl bg-indigo-100 flex items-center justify-center mx-auto mb-5">
               <Sparkles size={26} className="text-indigo-500" />
@@ -102,13 +102,13 @@ export default function ChatArea({
             ))}
 
             {isLoading && (
-              <div className="flex items-center gap-2.5 text-slate-400 text-sm py-2 px-1 animate-in">
+              <div role="status" className="flex items-center gap-2.5 text-slate-400 text-sm py-2 px-1 animate-in">
                 <div className="flex gap-1">
                   <span className="w-2 h-2 rounded-full bg-indigo-400 animate-bounce" style={{ animationDelay: "0ms" }} />
                   <span className="w-2 h-2 rounded-full bg-indigo-400 animate-bounce" style={{ animationDelay: "150ms" }} />
                   <span className="w-2 h-2 rounded-full bg-indigo-400 animate-bounce" style={{ animationDelay: "300ms" }} />
                 </div>
-                正在思考...
+                {status || "正在思考..."}
               </div>
             )}
 
@@ -140,6 +140,7 @@ export default function ChatArea({
           ) : (
             <button
               onClick={handleSubmit}
+              aria-label="发送消息"
               disabled={!input.trim()}
               className="shrink-0 w-9 h-9 rounded-xl bg-indigo-500 text-white hover:bg-indigo-600 disabled:opacity-30 disabled:cursor-not-allowed transition-all flex items-center justify-center shadow-sm"
             >

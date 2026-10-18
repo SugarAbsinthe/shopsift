@@ -1,4 +1,3 @@
-import { useEffect, useRef } from "react";
 import { Bug, Sparkles } from "lucide-react";
 import Sidebar from "./components/Sidebar";
 import ChatArea from "./components/ChatArea";
@@ -15,15 +14,6 @@ export default function App() {
     sendMessage,
     cancel,
   } = useChat();
-
-  const didInit = useRef(false);
-  useEffect(() => {
-    if (didInit.current) return;
-    didInit.current = true;
-    if (!state.currentConvId && state.conversations.length === 0) {
-      newConversation();
-    }
-  }, [state.conversations, state.currentConvId]);
 
   return (
     <div className="h-screen flex flex-col bg-white">
@@ -80,6 +70,7 @@ export default function App() {
           <ChatArea
             messages={state.messages}
             isLoading={state.isLoading}
+            status={state.status}
             onSend={sendMessage}
             onCancel={cancel}
           />

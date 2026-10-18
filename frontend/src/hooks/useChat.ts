@@ -25,6 +25,7 @@ interface AppState {
   isLoading: boolean;
   showDebug: boolean;
   error: string | null;
+  status: string | null;
 }
 
 const initialState: AppState = {
@@ -38,11 +39,13 @@ const initialState: AppState = {
   isLoading: false,
   showDebug: false,
   error: null,
+  status: null,
 };
 
 /* ---- Actions ---- */
 
 type Action =
+  | { type: "LOAD_CONVERSATIONS"; payload: Conversation[] }
   | { type: "SET_CONVERSATIONS"; payload: Conversation[] }
   | { type: "ADD_CONVERSATION"; payload: Conversation }
   | { type: "SET_CURRENT_CONV"; payload: string }
@@ -61,6 +64,13 @@ type Action =
 
 function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
+    case "LOAD_CONVERSATIONS":
+      return {
+        ...state,
+        conversations: [...state.conversations, ...action.payload.filter(
+          conv => !state.conversations.some(current => current.id === conv.id),
+        )],
+      };
     case "SET_CONVERSATIONS":
       return { ...state, conversations: action.payload };
     case "ADD_CONVERSATION":
@@ -103,7 +113,7 @@ function reducer(state: AppState, action: Action): AppState {
       return { ...state, messages: msgs };
     }
     case "SET_LOADING":
-      return { ...state, isLoading: action.payload };
+      return { ...state, isLoading: action.payload, status: action.payload ? state.status : null };
     case "SET_RESPONSE":
       return {
         ...state,
@@ -117,7 +127,7 @@ function reducer(state: AppState, action: Action): AppState {
     case "SET_ERROR":
       return { ...state, error: action.payload };
     case "SET_STATUS":
-      return { ...state, error: null };  // status messages are transient, just clear errors
+      return { ...state, status: action.payload };
     case "REMOVE_CONVERSATION":
       return {
         ...(state.currentConvId === action.payload ? { ...initialState, showDebug: state.showDebug } : state),
@@ -137,24 +147,36 @@ export function useChat() {
   const activeConvRef = useRef<string | null>(null);
   const selectionVersionRef = useRef(0);
   const requestVersionRef = useRef(0);
+  const creatingRef = useRef<number | null>(null);
+  const mountedRef = useRef(true);
 
   const invalidateStream = useCallback(() => {
+    creatingRef.current = null;
     requestVersionRef.current += 1;
     abortRef.current?.abort();
     abortRef.current = null;
   }, []);
 
-  useEffect(() => () => {
-    selectionVersionRef.current += 1;
-    activeConvRef.current = null;
-    invalidateStream();
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      selectionVersionRef.current += 1;
+      activeConvRef.current = null;
+      invalidateStream();
+    };
   }, [invalidateStream]);
 
   /* Load conversation list on mount */
   useEffect(() => {
+    let cancelled = false;
     api.listConversations().then((convs) => {
-      dispatch({ type: "SET_CONVERSATIONS", payload: convs });
-    }).catch(() => {});
+      if (cancelled) return;
+      dispatch({ type: "LOAD_CONVERSATIONS", payload: convs });
+    }).catch((e: Error) => {
+      if (!cancelled) dispatch({ type: "SET_ERROR", payload: `加载历史对话失败：${e.message}` });
+    });
+    return () => { cancelled = true; };
   }, []);
 
   /* Select a conversation */
@@ -182,15 +204,34 @@ export function useChat() {
 
   /* Create new conversation */
   const newConversation = useCallback(async () => {
+    if (creatingRef.current !== null) return null;
+    invalidateStream();
     const selectionVersion = ++selectionVersionRef.current;
+    creatingRef.current = selectionVersion;
+    dispatch({ type: "SET_LOADING", payload: true });
+    dispatch({ type: "SET_ERROR", payload: null });
+    dispatch({ type: "SET_STATUS", payload: "正在创建对话..." });
     try {
       const conv = await api.createConversation();
+      if (!mountedRef.current) return null;
       dispatch({ type: "ADD_CONVERSATION", payload: conv });
-      if (selectionVersion === selectionVersionRef.current) await selectConversation(conv.id);
+      if (selectionVersion !== selectionVersionRef.current) return null;
+      // A freshly created conversation is empty; no history fetch is needed.
+      activeConvRef.current = conv.id;
+      dispatch({ type: "SET_CURRENT_CONV", payload: conv.id });
+      return conv.id;
     } catch (e: any) {
-      if (selectionVersion === selectionVersionRef.current) dispatch({ type: "SET_ERROR", payload: e.message });
+      if (mountedRef.current && selectionVersion === selectionVersionRef.current) {
+        dispatch({ type: "SET_ERROR", payload: e.message });
+      }
+      return null;
+    } finally {
+      if (creatingRef.current === selectionVersion) creatingRef.current = null;
+      if (mountedRef.current && selectionVersion === selectionVersionRef.current) {
+        dispatch({ type: "SET_LOADING", payload: false });
+      }
     }
-  }, [selectConversation]);
+  }, [invalidateStream]);
 
   /* Delete conversation */
   const removeConversation = useCallback(async (convId: string) => {
@@ -209,8 +250,10 @@ export function useChat() {
 
   /* Send a message (streaming) */
   const sendMessage = useCallback(async (question: string) => {
-    const convId = state.currentConvId;
-    if (!convId || activeConvRef.current !== convId || !question.trim()) return;
+    if (!question.trim()) return;
+    let convId = state.currentConvId;
+    if (!convId) convId = await newConversation();
+    if (!convId || activeConvRef.current !== convId) return;
 
     /* Cancel any in-flight request */
     invalidateStream();
@@ -225,12 +268,19 @@ export function useChat() {
     dispatch({ type: "SET_LOADING", payload: true });
     dispatch({ type: "SET_ERROR", payload: null });
     dispatch({ type: "ADD_MESSAGE", payload: { role: "user", content: question } });
-    api.saveMessage(convId, "user", question).catch(() => {});
+    const saveFailed = () => {
+      if (isCurrent()) {
+        dispatch({ type: "SET_ERROR", payload: "消息保存失败，当前内容仅保留在页面中，请勿直接刷新。" });
+      }
+      return false;
+    };
+    const userSaved = api.saveMessage(convId, "user", question).then(() => true, saveFailed);
+    let assistantSaved: Promise<unknown> | undefined;
 
     /* Add empty assistant placeholder for streaming */
     dispatch({ type: "ADD_MESSAGE", payload: { role: "assistant", content: "" } });
 
-    const chatHistory: ChatMessage[] = state.messages
+    const chatHistory: ChatMessage[] = (state.currentConvId === convId ? state.messages : [])
       .filter((m) => m.role === "user" || m.role === "assistant")
       .map((m) => ({ role: m.role, content: m.content }));
 
@@ -268,26 +318,32 @@ export function useChat() {
           answerText = meta.answer;
           dispatch({ type: "SET_ANSWER", payload: answerText });
           if (answerText) {
-            api.saveMessage(convId, "assistant", answerText, {
-              run_id: meta.run_id,
-              stage: meta.stage,
-              tool_rounds: meta.tool_rounds,
-              agent_rounds: meta.agent_rounds,
-              stop_reason: meta.stop_reason,
-              latency_ms: meta.latency_ms,
-              request_id: meta.request_id,
-              llm_calls: meta.llm_calls,
-              llm_latency_ms: meta.llm_latency_ms,
-              llm_retries: meta.llm_retries,
-              input_tokens: meta.input_tokens,
-              output_tokens: meta.output_tokens,
-              total_tokens: meta.total_tokens,
-              retrieval_triggered: meta.retrieval_triggered,
-              cache_hit: meta.cache_hit,
-              requested_tools: meta.requested_tools,
-              executed_tools: meta.executed_tools,
-              tool_errors: meta.tool_errors,
-            }).catch(() => {});
+            // Keep database ID order consistent with the displayed turn. A
+            // failed user save must not leave an orphan assistant message.
+            const finalAnswer = answerText;
+            assistantSaved = userSaved.then(saved => {
+              if (!saved) return;
+              return api.saveMessage(convId, "assistant", finalAnswer, {
+                run_id: meta.run_id,
+                stage: meta.stage,
+                tool_rounds: meta.tool_rounds,
+                agent_rounds: meta.agent_rounds,
+                stop_reason: meta.stop_reason,
+                latency_ms: meta.latency_ms,
+                request_id: meta.request_id,
+                llm_calls: meta.llm_calls,
+                llm_latency_ms: meta.llm_latency_ms,
+                llm_retries: meta.llm_retries,
+                input_tokens: meta.input_tokens,
+                output_tokens: meta.output_tokens,
+                total_tokens: meta.total_tokens,
+                retrieval_triggered: meta.retrieval_triggered,
+                cache_hit: meta.cache_hit,
+                requested_tools: meta.requested_tools,
+                executed_tools: meta.executed_tools,
+                tool_errors: meta.tool_errors,
+              }).catch(saveFailed);
+            });
           } else {
             dispatch({ type: "REMOVE_EMPTY_ASSISTANT" });
           }
@@ -313,6 +369,8 @@ export function useChat() {
           dispatch({ type: "SET_ERROR", payload: message });
         },
       }, controller.signal);
+      await userSaved;
+      await assistantSaved;
 
       /* Refresh conversation list (title may have changed) */
       if (!isCurrent()) return;
@@ -333,9 +391,10 @@ export function useChat() {
         dispatch({ type: "SET_LOADING", payload: false });
       }
     }
-  }, [state.currentConvId, state.messages, invalidateStream]);
+  }, [state.currentConvId, state.messages, invalidateStream, newConversation]);
 
   const cancel = useCallback(() => {
+    if (creatingRef.current !== null) selectionVersionRef.current += 1;
     invalidateStream();
     dispatch({ type: "REMOVE_EMPTY_ASSISTANT" });
     dispatch({ type: "SET_LOADING", payload: false });

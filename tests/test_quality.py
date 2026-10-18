@@ -19,7 +19,7 @@ def test_default_manifest_validates_case_count_and_checksum():
     manifest, context = validate_dataset_artifact(
         "evals/datasets/contracts/manifest.json", "agent-behavior-v1"
     )
-    assert manifest.dataset_version == "v1"
+    assert manifest.dataset_version == "v2"
     assert context.case_count == 25
     assert len(context.sha256) == 64
     assert context.path == "evals/cases.jsonl"

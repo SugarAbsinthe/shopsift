@@ -1,8 +1,8 @@
 {"id":"discovery_greeting","question":"你好","expected_stages":["discovery"],"expected_retrieval":false,"forbidden_tools":["get_product_detail","get_reviews","compare_products","get_user_profile"],"tags":["stage","no_tool"]}
 {"id":"discovery_capability","question":"你能帮我做什么？","expected_stages":["discovery"],"expected_retrieval":false,"classifier_response":"discovery","tags":["stage","fallback_classifier"]}
 {"id":"needs_budget_gaming","question":"预算8000左右，主要打游戏","expected_stages":["needs_elicitation"],"expected_retrieval":false,"expected_profile_keys":["budget","primary_use"],"tags":["stage","profile"]}
-{"id":"needs_coding_laptop","question":"我想买笔记本用来编程开发","expected_stages":["needs_elicitation"],"expected_retrieval":false,"expected_profile_keys":["product_category","primary_use"],"tags":["stage","profile"]}
-{"id":"needs_mobility","question":"经常出差，希望电脑轻薄方便携带","expected_stages":["needs_elicitation"],"expected_retrieval":false,"expected_profile_keys":["product_category","mobility"],"expected_pending_profile_keys":["primary_use"],"tags":["stage","profile"]}
+{"id":"needs_coding_laptop","question":"我想买笔记本用来编程开发","expected_stages":["search"],"expected_retrieval":true,"expected_profile_keys":["product_category","primary_use"],"tags":["stage","profile","early_recommendation"]}
+{"id":"needs_mobility","question":"经常出差，希望电脑轻薄方便携带","expected_stages":["search"],"expected_retrieval":true,"expected_profile_keys":["product_category","mobility"],"expected_pending_profile_keys":["primary_use"],"tags":["stage","profile","early_recommendation"]}
 {"id":"search_explicit","question":"推荐几款性价比高的笔记本","expected_stages":["search"],"expected_retrieval":true,"tags":["stage","workflow_retrieval"]}
 {"id":"search_catalog","question":"现在有哪些适合学生的机器？","expected_stages":["search"],"expected_retrieval":true,"expected_profile_keys":["primary_use"],"tags":["search_precedence","profile"]}
 {"id":"comparison_keyword","question":"联想和华硕哪个好，帮我对比一下","expected_stages":["comparison"],"required_tools":["compare_products"],"expected_retrieval":true,"scripted_tool_rounds":[["compare_products"]],"tags":["stage","tool"]}
