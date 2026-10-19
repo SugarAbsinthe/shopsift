@@ -16,7 +16,7 @@ async function renderProducts(content) {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const context = { exports: {}, require(name) {
-    if (name === 'react') return { ...React, useState: () => ['products', () => {}] };
+    if (name === 'react') return { ...React, useState: initial => [initial === 'profile' ? 'products' : initial, () => {}] };
     if (name === 'react-markdown') return { __esModule: true, default: Markdown };
     if (name === 'remark-gfm') return { __esModule: true, default: gfm };
     if (name === 'lucide-react') return { X: () => null };

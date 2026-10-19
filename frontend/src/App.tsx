@@ -43,7 +43,7 @@ export default function App() {
       </header>
 
       {/* Body */}
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 min-h-0 overflow-hidden">
         <Sidebar
           conversations={state.conversations}
           currentConvId={state.currentConvId}
@@ -54,7 +54,7 @@ export default function App() {
           onDelete={removeConversation}
         />
 
-        <main className="flex-1 flex flex-col min-w-0 bg-slate-50/50">
+        <main className="flex-1 flex flex-col min-w-0 min-h-0 bg-slate-50/50">
           {state.error && (
             <div className="bg-red-50 border-b border-red-200 px-5 py-2.5 text-sm text-red-700 flex items-center animate-in">
               <span className="flex-1">{state.error}</span>
@@ -67,13 +67,15 @@ export default function App() {
             </div>
           )}
 
-          <ChatArea
-            messages={state.messages}
-            isLoading={state.isLoading}
-            status={state.status}
-            onSend={sendMessage}
-            onCancel={cancel}
-          />
+          <div className="flex-1 min-h-0">
+            <ChatArea
+              messages={state.messages}
+              isLoading={state.isLoading}
+              status={state.status}
+              onSend={sendMessage}
+              onCancel={cancel}
+            />
+          </div>
 
           <DebugPanel
             stage={state.lastStage}
