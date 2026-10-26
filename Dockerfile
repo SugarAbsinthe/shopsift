@@ -10,7 +10,10 @@ COPY pyproject.toml .
 COPY src/ ./src/
 COPY backend/ ./backend/
 COPY datasets/ ./datasets/
-RUN pip install --no-cache-dir -e .
+# The default Compose runtime uses CPU embeddings and a remote chat API.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch --index-url "$TORCH_INDEX_URL" \
+    && pip install --no-cache-dir -e .
 
 EXPOSE 8000
 
