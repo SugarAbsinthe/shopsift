@@ -90,7 +90,6 @@ docker compose up --build
 |---|---|
 | 后端直接执行 | `python -m backend.main` 或 `python backend/main.py`；自带 reload，监听 `0.0.0.0:8000`，服务及目录 API 已验证 |
 | 前端构建后预览 | `npm --prefix frontend run build` 后执行 `npm --prefix frontend run preview`；默认 4173，需另启后端，页面及 API 代理已验证 |
-| 旧版 Streamlit | `python -m streamlit run src/ui/shopping_app.py`；默认 8501，仅 HTTP 服务与健康检查通过，交互和对话未验 |
 
 验证结果对应执行时的源码，不代表全品类回答质量验收；独立 Linux / macOS 尚未实测。
 

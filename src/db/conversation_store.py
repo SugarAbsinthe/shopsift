@@ -1,7 +1,7 @@
 """Persistent conversation storage using SQLite.
 
 Stores conversations and messages so that history survives
-Streamlit restarts. Supports multi-conversation switching.
+application restarts. Supports multi-conversation switching.
 """
 import json
 import uuid
