@@ -1,8 +1,8 @@
 [project]
 name = "shopsift"
 version = "0.1.0"
-description = "ShopSift: a profile-aware shopping guide for laptop recommendations with LangGraph"
-requires-python = ">=3.9"
+description = "ShopSift: a profile-aware shopping guide for seven product categories with LangGraph"
+requires-python = ">=3.10"
 dependencies = [
     "langchain>=0.3.0",
     "langchain-openai>=0.2.0",
@@ -12,12 +12,7 @@ dependencies = [
     "uvicorn>=0.30.0",
     "chromadb>=0.5.0",
     "sentence-transformers>=3.0.0",
-    "pandas>=2.0.0",
-    "plotly>=5.18.0",
     "python-dotenv>=1.0.0",
-    "beautifulsoup4>=4.12.0",
-    "lxml>=5.0.0",
-    "requests>=2.31.0",
     "redis>=5.0.0",
     "hiredis>=2.3.0",
 ]
