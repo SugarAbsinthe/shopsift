@@ -179,30 +179,14 @@ config = Config()
 
 
 def ensure_hf_offline_if_needed() -> bool:
-    """Check if model cache exists locally; set offline if so.
+    """Report explicit offline policy without guessing cache completeness.
 
-    Avoids network timeouts by checking local cache directory first.
-    Only attempts online if the model has never been downloaded.
+    Keep cache-path resolution and downloads with Hugging Face. An existing
+    directory may contain another model or an interrupted download, so it
+    must never change the user's network policy.
     """
-    import logging
-    logger = logging.getLogger(__name__)
-
-    if os.environ.get("HF_HUB_OFFLINE") == "1":
-        return True
-    # An explicit online setting must also win over the cache heuristic:
-    # the cache directory can contain another model or an incomplete download.
-    if os.environ.get("HF_HUB_OFFLINE") == "0":
-        return False
-
-    # Check if the embedding model is already cached locally
-    from pathlib import Path
-    cache_root = os.environ.get("HF_HOME", os.path.join(str(Path.home()), ".cache", "huggingface"))
-    hub_dir = os.path.join(cache_root, "hub")
-    if os.path.isdir(hub_dir):
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
-        logger.info("Model cache found at %s — using offline mode", hub_dir)
-        return True
-
-    logger.info("No model cache found — online mode")
-    return False
+    # Match HF Hub's explicit flag precedence, including its legacy alias.
+    value = os.environ.get("HF_HUB_OFFLINE") or os.environ.get("TRANSFORMERS_OFFLINE")
+    offline = value is not None and value.upper() in {"1", "ON", "YES", "TRUE"}
+    logging.getLogger(__name__).info("Hugging Face offline mode: %s (explicit policy)", offline)
+    return offline

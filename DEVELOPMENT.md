@@ -36,7 +36,7 @@ uv python install 3.12
 
 Node.js 安装 [24 系列 Linux 发行包](https://nodejs.org/en/download)。若 npm 指向 `/mnt/c/...` 或 `/mnt/d/...`，调整 PATH 并执行 `hash -r`；不要使用 Windows npm 安装 Linux 依赖。
 
-迁移 `.env` 时将 `D:/...` 改为实际 Linux 路径，数据库和索引建议使用当前副本的默认 `data/`。可用 `HF_HUB_CACHE` 指向已有完整权重缓存；首次下载保持 `HF_HUB_OFFLINE=0`、`TRANSFORMERS_OFFLINE=0`，离线开关只在缓存完整后启用。
+迁移 `.env` 时将 `D:/...` 改为实际 Linux 路径，数据库和索引建议使用当前副本的默认 `data/`。可用 `HF_HUB_CACHE` 指向已有完整权重缓存；首次下载保持 `HF_HUB_OFFLINE=0`、`TRANSFORMERS_OFFLINE=0`，离线开关只在缓存完整后启用。未设置时不按缓存目录自动切换，缓存路径与下载由 SDK 处理。
 
 ### Bash 手动验证
 
