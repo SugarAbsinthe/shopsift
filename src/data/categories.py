@@ -75,6 +75,21 @@ def category_mentions(text: str):
         yield "电脑", "笔记本电脑"
 
 
+def purchase_category(text: str) -> tuple[str, str]:
+    """Find an affirmative category without treating a negated noun as a switch."""
+    lower = text.casefold()
+    for alias, category in category_mentions(lower):
+        for match in re.finditer(re.escape(alias), lower):
+            prefix = re.split(r"[,，。;；!?！？\n]|但是|不过|而是|但", lower[:match.start()])[-1]
+            suffix = re.split(r"[,，。;；!?！？\n]|但是|不过|而是|但", lower[match.end():])[0]
+            if re.search(r"不|没|无需|无须|并非|别|排除|除了", prefix):
+                continue
+            if re.match(r"\s*(?:不|没|无需|无须|并非)", suffix):
+                continue
+            return alias, category
+    return "", ""
+
+
 def matches_spec_filters(normalized: dict, filters) -> bool:
     for condition in filters:
         value = normalized.get(condition.field)
@@ -238,6 +253,7 @@ def merge_spec_filters(previous: list[dict], current: str, category: str) -> lis
                 continue
             del predicates[key]
     replacing_sets = bool(re.search(r"只需要|只要|改为|改成", current))
+    replacing_bounds = bool(re.search(r"改为|改成|改到|换成|调整为|调整到", current))
     replaced = set()
     for predicate in additions:
         field, op = predicate["field"], predicate["op"]
@@ -249,6 +265,11 @@ def merge_spec_filters(previous: list[dict], current: str, category: str) -> lis
             if old := predicates.get(key):
                 predicate = {**predicate, "value": list(dict.fromkeys(old["value"] + predicate["value"]))}
         else:
+            if FILTER_FIELDS.get(field) == "number" and replacing_bounds and field not in replaced:
+                for old_key in list(predicates):
+                    if old_key[0] == field:
+                        del predicates[old_key]
+                replaced.add(field)
             for old_key in list(predicates):
                 if old_key[0] == field and (op == "eq" or old_key[1] == "eq"):
                     del predicates[old_key]

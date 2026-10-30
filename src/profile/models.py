@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import Literal
 
 
-MEMORY_SCHEMA_VERSION = "1.0"
+MEMORY_SCHEMA_VERSION = "1.1"
 MemoryType = Literal["explicit", "inferred"]
 MemoryStatus = Literal["pending", "confirmed", "rejected", "expired", "deleted"]
 
@@ -46,6 +46,7 @@ class MemoryCandidate:
     expires_at: str
     status: MemoryStatus
     schema_version: str = MEMORY_SCHEMA_VERSION
+    category_scope: str = ""
 
     def model_dump(self) -> dict:
         """Return a serialization shape compatible with other project models."""

@@ -38,6 +38,7 @@ from src.retrieval.models import RetrievalResult, VerificationResult
 from src.retrieval.verifier import verify_answer
 from src.agent.tool_gateway import ToolGateway
 from src.profile.models import make_source_message_id
+from src.profile.commands import handle_profile_command, process_profile_commands
 
 from backend.logging_config import (
     Timer,
@@ -75,6 +76,7 @@ class ShoppingState(TypedDict, total=False):
     retrieval_result: dict
     evidence: list[dict]
     verification: dict
+    profile_clarification: str
 
 
 _UNTRUSTED_DATA_START = "<UNTRUSTED_PRODUCT_DATA>"
@@ -265,63 +267,13 @@ def _record_profile_signal(
         pass
 
 
-def handle_profile_command(conv_id: str, message: str, profile_store) -> bool:
-    """Handle explicit confirmation, rejection, or deletion requests."""
-    command = message.strip()
-    if re.search(r"不要\s*(?:删除|忘记|清除)", command):
-        return False
-    candidate_id_pattern = r"((?:mem|legacy)_[a-zA-Z0-9]+)"
-    confirm = re.search(
-        rf"(?:确认|接受|保留)\s*(?:画像)?(?:候选)?\s*[:：]?\s*{candidate_id_pattern}",
-        command,
-    )
-    reject = re.search(
-        rf"(?:拒绝|不要|否决)\s*(?:画像)?(?:候选)?\s*[:：]?\s*{candidate_id_pattern}",
-        command,
-    )
-    delete_candidate = re.search(
-        rf"(?:删除|忘记|清除)\s*(?:画像)?(?:候选)?\s*[:：]?\s*{candidate_id_pattern}",
-        command,
-    )
-    delete = re.search(
-        r"(?:删除|忘记|清除|取消|撤销)\s*(?:刚才的)?\s*(?:画像|偏好)?\s*[:：]?\s*"
-        r"(budget|primary_use|preferred_brand|mobility|must_have|exclude_brand|"
-        r"screen_preference|battery_requirement|product_category|预算|用途|品牌偏好|"
-        r"移动需求|刚需|排除品牌|品牌排除|屏幕偏好|续航要求|商品品类)",
-        command,
-        re.IGNORECASE,
-    )
-    try:
-        if confirm:
-            profile_store.confirm_candidate(conv_id, confirm.group(1))
-            return True
-        if reject:
-            profile_store.reject_candidate(conv_id, reject.group(1))
-            return True
-        if delete_candidate:
-            profile_store.delete_candidate(conv_id, delete_candidate.group(1))
-            return True
-        if delete:
-            aliases = {
-                "预算": "budget",
-                "用途": "primary_use",
-                "品牌偏好": "preferred_brand",
-                "移动需求": "mobility",
-                "刚需": "must_have",
-                "排除品牌": "exclude_brand",
-                "品牌排除": "exclude_brand",
-                "屏幕偏好": "screen_preference",
-                "续航要求": "battery_requirement",
-                "商品品类": "product_category",
-            }
-            key = aliases.get(delete.group(1), delete.group(1).lower())
-            profile_store.delete_profile_key(conv_id, key)
-            return True
-    except (KeyError, ValueError):
-        # A malformed or stale command must not fall through into profile
-        # extraction, which could turn the command text into a new preference.
-        return True
-    return False
+
+def _profile_view_for_message(store, conv_id: str, message: str):
+    from src.data.categories import purchase_category
+    _, category = purchase_category(message)
+    if category and callable(getattr(type(store), "for_category", None)):
+        return store.for_category(conv_id, category)
+    return store
 
 
 class ShoppingGuideGraph:
@@ -525,26 +477,36 @@ class ShoppingGuideGraph:
                 break
 
         # Lifecycle commands are deterministic and scoped to this conversation.
-        command_handled = False
-        if last_user_msg:
-            command_handled = handle_profile_command(
-                conv_id, last_user_msg, self.profile_store
-            )
-            if not command_handled:
-                session_profile = self._extract_profile_signals(conv_id, last_user_msg)
-            else:
-                session_profile = {}
-        else:
-            session_profile = {}
+        turn_store = _profile_view_for_message(self.profile_store, conv_id, last_user_msg)
+        budget_hint = bool(state.get("profile_clarification")) and bool(re.fullmatch(
+            rf"(?:最多|可以到|放宽到|改为|改成)?\s*{_PRICE_TOKEN_PATTERN}\s*(?:元|块钱|块)?[。！!]?",
+            last_user_msg.strip(), re.I,
+        ))
+        session_profile = {}
+
+        def extract_clause(text):
+            values = self._extract_profile_signals(conv_id, text, budget_hint=budget_hint,
+                                                   source_message=last_user_msg, profile_store=turn_store)
+            session_profile.update(values)
+            changed = set(values)
+            if parse_budget_expression(text) is not None or budget_hint:
+                changed.add("budget")
+            return changed
+
+        commands = process_profile_commands(conv_id, last_user_msg, turn_store, on_text=extract_clause,
+                                             on_clear=lambda key: session_profile.pop(key, None))
+        signal_text = commands.remaining_text
 
         # Reload profile after extraction
-        user_profile = self.profile_store.serialize_profile(conv_id)
-        structured_getter = getattr(self.profile_store, "get_structured", None)
+        user_profile = turn_store.serialize_profile(conv_id)
+        structured_getter = getattr(turn_store, "get_structured", None)
         structured_profile = structured_getter(conv_id) if structured_getter else {}
         if not isinstance(structured_profile, dict):
             structured_profile = {}
         effective_profile = dict(structured_profile)
         effective_profile.update(session_profile)
+        for key in commands.session_cleared:
+            effective_profile.pop(key, None)
         preferred = session_profile.get("preferred_brand", {}).get("value", "")
         excluded = session_profile.get("exclude_brand", {}).get("value", "")
         if preferred and effective_profile.get("exclude_brand", {}).get("value", "").casefold() == preferred.casefold():
@@ -556,10 +518,16 @@ class ShoppingGuideGraph:
                 f"- {key}: {item['value']}" for key, item in session_profile.items()
             )
             user_profile += "\n## 本轮临时约束（不持久化）\n" + session_lines
+        if commands.session_cleared:
+            user_profile += "\n## 本轮不采用的历史条件\n" + "、".join(commands.session_cleared)
+        serializer = getattr(turn_store, "serialize_effective", None)
+        if callable(getattr(type(turn_store), "serialize_effective", None)):
+            user_profile = serializer(conv_id, effective_profile)
 
         # Decide with this turn's requirements, not the previous profile alone.
-        stage = "needs_elicitation" if command_handled else self._classify_stage(
-            last_user_msg, state.get("stage", "discovery"),
+        clarification = commands.clarification
+        stage = "needs_elicitation" if clarification or (commands.handled and not signal_text) else self._classify_stage(
+            "预算" + signal_text if budget_hint else signal_text, state.get("stage", "discovery"),
             structured_profile=effective_profile, history=messages[:-1],
         )
 
@@ -568,6 +536,7 @@ class ShoppingGuideGraph:
             "user_profile": user_profile,
             "profile_constraints": build_retrieval_constraints(effective_profile),
             "session_profile": session_profile,
+            "profile_clarification": clarification,
         }
 
     @_observe_node("retrieve")
@@ -711,6 +680,11 @@ class ShoppingGuideGraph:
         conv_id = state.get("conv_id", "")
         agent_rounds = state.get("agent_rounds", 0)
 
+        if state.get("profile_clarification"):
+            return {"messages": [AIMessage(content=state["profile_clarification"])],
+                    "agent_rounds": agent_rounds, "stop_reason": "completed",
+                    "verification": VerificationResult().model_dump()}
+
         structured = state.get("retrieval_result") or {}
         last_question = next((m.content for m in reversed(state['messages']) if isinstance(m,HumanMessage)), '')
         if (structured and not structured.get('products')
@@ -797,6 +771,11 @@ class ShoppingGuideGraph:
         try:
             result = self.tool_gateway.invoke(state)
             tool_messages = result.get("messages", [])
+            # Profile tools see the same effective turn constraints as the
+            # prompt and retriever, including temporary category switches.
+            for message in tool_messages:
+                if getattr(message, "name", "") == "get_user_profile" and getattr(message, "status", "success") == "success":
+                    message.content = state.get("user_profile", message.content)
             has_error = any(
                 isinstance(message, ToolMessage)
                 and getattr(message, "status", "success") == "error"
@@ -967,9 +946,10 @@ class ShoppingGuideGraph:
             **context,
         )
 
-    def _extract_profile_signals(self, conv_id: str, user_message: str) -> dict:
+    def _extract_profile_signals(self, conv_id: str, user_message: str, *, budget_hint: bool = False, source_message: str | None = None, profile_store=None) -> dict:
         """Lightweight profile signal extraction from user message."""
-        return extract_profile_signals(conv_id, user_message, self.profile_store)
+        return extract_profile_signals(conv_id, user_message, profile_store if profile_store is not None else self.profile_store,
+                                       budget_hint=budget_hint, source_message=source_message)
 
     # ---- Public API ----
 
@@ -1357,6 +1337,7 @@ def parse_budget_expression(message: str) -> str | None:
     # Remove thousands separators, but retain clause boundaries. A specification
     # elsewhere in the sentence must not inherit the word "预算".
     text = re.sub(r"(?<=\d)[,，](?=\d{3}(?:\D|$))", "", message)
+    text = re.sub(r"预算\s*(?:放宽到|提高到|降低到|调整到|改为|改成)\s*", "预算", text)
     flags = re.IGNORECASE
     price_token = rf"(?<![A-Za-z0-9.]){_PRICE_TOKEN_PATTERN}(?![A-Za-z0-9.])"
 
@@ -1423,6 +1404,13 @@ def parse_budget_expression(message: str) -> str | None:
     if bare_match:
         amount = _parse_price_amount(bare_match.group("amount"))
         return f"<={amount}" if amount is not None else None
+    purchase = re.search(r"买|挑|选购|推荐|找", text) and not re.search(r"售价|标价|报价|这款|这台", text)
+    if purchase:
+        quoted = re.search(rf"(?P<amount>{price_token})\s*(?:元|块钱|块)(?:以内|以下)?的?\s*(?:无线)?"
+                           r"(?:鼠标|键盘|显示器|手机|笔记本|电脑|平板|耳机)", text, flags)
+        if quoted:
+            amount = _parse_price_amount(quoted["amount"])
+            return f"<={amount}" if amount is not None else None
     return None
 
 
@@ -1596,14 +1584,15 @@ def classify_stage(
     return "needs_elicitation" if negated_category else (current_stage or "discovery")
 
 
-def extract_profile_signals(conv_id: str, user_message: str, profile_store) -> dict:
+def extract_profile_signals(conv_id: str, user_message: str, profile_store, *, budget_hint: bool = False, source_message: str | None = None) -> dict:
     """Extract profile signals and return non-persistent, turn-local values."""
     message = user_message.strip()
+    profile_store = _profile_view_for_message(profile_store, conv_id, source_message or message)
     message_lower = message.lower()
     # "暂时不要推荐" changes pacing, not the lifetime of the purchase needs.
     scope_text = re.sub(
         r"暂时(?=(?:先)?(?:不要|不用|不需要|不急着|不|别)?(?:推荐|讨论|梳理|理清|聊))",
-        "", message,
+        "", source_message or message,
     )
     is_session_only = bool(
         re.search(r"(?:这次|本次|这回|暂时|临时|先看看)", scope_text, re.IGNORECASE)
@@ -1635,7 +1624,7 @@ def extract_profile_signals(conv_id: str, user_message: str, profile_store) -> d
         _record_profile_signal(
             profile_store,
             conv_id,
-            message,
+            source_message or message,
             key,
             value,
             memory_type=memory_type,
@@ -1645,34 +1634,23 @@ def extract_profile_signals(conv_id: str, user_message: str, profile_store) -> d
         )
 
     budget = parse_budget_expression(message)
-    if budget:
-        record(
-            "budget",
-            budget,
-            memory_type="explicit",
-            confidence=0.95,
-            matched_text="预算" if "预算" in message else message,
-        )
-
-    from src.data.categories import category_mentions, has_spec_requirement_edits, merge_requirement_text
+    if budget is None and budget_hint:
+        reply = re.sub(r"^(?:最多|可以到|放宽到|改为|改成)\s*", "", message)
+        budget = parse_budget_expression("预算" + reply)
+    from src.data.categories import purchase_category, has_spec_requirement_edits, merge_requirement_text
     getter = getattr(profile_store, "get_structured", None)
     previous = getter(conv_id) if callable(getter) else {}
     if not isinstance(previous, dict): previous = {}
-    detected_category = ""
-    for keyword, category in category_mentions(message_lower):
-        if affirmative(keyword):
-            detected_category = category
-            record(
-                "product_category",
-                category,
-                memory_type="explicit",
-                confidence=0.95,
-                matched_text=keyword,
-            )
-            break
+    keyword, detected_category = purchase_category(message)
+    if detected_category:
+        record("product_category", detected_category, memory_type="explicit",
+               confidence=0.95, matched_text=keyword)
+    if budget:
+        record("budget", budget, memory_type="explicit", confidence=0.95,
+               matched_text="预算" if "预算" in message else message)
 
     if detected_category and detected_category != previous.get("product_category", {}).get("value", ""):
-        if callable(getattr(type(profile_store), "delete_profile_key", None)) and not is_session_only:
+        if callable(getattr(type(profile_store), "delete_profile_key", None)) and not is_session_only and not callable(getattr(type(profile_store), "serialize_effective", None)):
             profile_store.delete_profile_key(conv_id, "must_have")
         previous = {k:v for k,v in previous.items() if k != "must_have"}
     effective_category = detected_category or previous.get("product_category", {}).get("value", "")

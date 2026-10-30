@@ -79,6 +79,20 @@ class ProfileStore:
 
     def _init_db(self) -> None:
         conn = self._connect()
+        try:
+            self._initialize_tables(conn)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _initialize_tables(self, conn: sqlite3.Connection) -> None:
+        conn.execute("BEGIN IMMEDIATE")
+        old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(user_profiles)")}
+        if old_columns and "category_scope" not in old_columns:
+            conn.execute("ALTER TABLE user_profiles RENAME TO user_profiles_unscoped")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_profiles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,7 +102,8 @@ class ProfileStore:
                 confidence REAL NOT NULL DEFAULT 1.0,
                 last_updated TEXT NOT NULL,
                 source TEXT NOT NULL DEFAULT 'explicit',
-                UNIQUE(conv_id, profile_key)
+                category_scope TEXT NOT NULL DEFAULT '',
+                UNIQUE(conv_id, category_scope, profile_key)
             )
         """)
         profile_columns = {
@@ -96,6 +111,20 @@ class ProfileStore:
         }
         if "candidate_id" not in profile_columns:
             conn.execute("ALTER TABLE user_profiles ADD COLUMN candidate_id TEXT")
+        if old_columns and "category_scope" not in old_columns:
+            candidate_column = "p.candidate_id" if "candidate_id" in old_columns else "NULL"
+            conn.execute(f"""
+                INSERT INTO user_profiles
+                    (id, conv_id, profile_key, profile_value, confidence, last_updated, source, candidate_id, category_scope)
+                SELECT p.id, p.conv_id, p.profile_key, p.profile_value, p.confidence,
+                       p.last_updated, p.source, {candidate_column},
+                       CASE WHEN p.profile_key = 'product_category' THEN '' ELSE COALESCE(
+                           (SELECT c.profile_value FROM user_profiles_unscoped c
+                            WHERE c.conv_id = p.conv_id AND c.profile_key = 'product_category'
+                            AND c.source = 'explicit'), '') END
+                FROM user_profiles_unscoped p
+            """)
+            conn.execute("DROP TABLE user_profiles_unscoped")
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_profiles_conv
             ON user_profiles(conv_id)
@@ -113,9 +142,20 @@ class ProfileStore:
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('pending', 'confirmed', 'rejected', 'expired', 'deleted')),
-                schema_version TEXT NOT NULL
+                schema_version TEXT NOT NULL,
+                category_scope TEXT NOT NULL DEFAULT ''
             )
         """)
+        memory_columns = {row["name"] for row in conn.execute("PRAGMA table_info(memory_candidates)")}
+        if "category_scope" not in memory_columns:
+            conn.execute("ALTER TABLE memory_candidates ADD COLUMN category_scope TEXT NOT NULL DEFAULT ''")
+            conn.execute("""
+                UPDATE memory_candidates SET category_scope = COALESCE(
+                    (SELECT p.profile_value FROM user_profiles p
+                     WHERE p.conv_id = memory_candidates.conv_id AND p.profile_key = 'product_category'
+                     AND p.source = 'explicit'), '')
+                WHERE profile_key != 'product_category' AND status IN ('pending', 'confirmed')
+            """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memory_candidates_conv_status
             ON memory_candidates(conv_id, status, created_at)
@@ -124,15 +164,15 @@ class ProfileStore:
             CREATE INDEX IF NOT EXISTS idx_memory_candidates_conv_key
             ON memory_candidates(conv_id, profile_key, created_at)
         """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_candidates_scope_key "
+                     "ON memory_candidates(conv_id, category_scope, profile_key, created_at)")
         self._migrate_legacy_profiles(conn)
-        conn.commit()
-        conn.close()
 
     @staticmethod
     def _migrate_legacy_profiles(conn: sqlite3.Connection) -> None:
         rows = conn.execute(
             "SELECT id, conv_id, profile_key, profile_value, confidence, "
-            "last_updated, source, candidate_id FROM user_profiles"
+            "last_updated, source, candidate_id, category_scope FROM user_profiles"
         ).fetchall()
         for row in rows:
             if row["candidate_id"] and conn.execute(
@@ -157,8 +197,8 @@ class ProfileStore:
                 INSERT INTO memory_candidates (
                     candidate_id, conv_id, profile_key, profile_value, memory_type,
                     confidence, source_message_id, evidence_span, created_at,
-                    expires_at, status, schema_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)
+                    expires_at, status, schema_version, category_scope
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
             """, (
                 candidate_id,
                 row["conv_id"],
@@ -171,6 +211,7 @@ class ProfileStore:
                 _to_iso(created_at + timedelta(days=ttl)),
                 status,
                 MEMORY_SCHEMA_VERSION,
+                row["category_scope"],
             ))
             if status == "confirmed":
                 conn.execute(
@@ -221,6 +262,7 @@ class ProfileStore:
             expires_at=row["expires_at"],
             status=row["status"],
             schema_version=row["schema_version"],
+            category_scope=row["category_scope"],
         )
 
     @staticmethod
@@ -245,8 +287,8 @@ class ProfileStore:
             )
             if row["status"] == "confirmed":
                 conn.execute(
-                    "DELETE FROM user_profiles WHERE conv_id = ? AND profile_key = ?",
-                    (conv_id, row["profile_key"]),
+                    "DELETE FROM user_profiles WHERE conv_id = ? AND candidate_id = ?",
+                    (conv_id, row["candidate_id"]),
                 )
         return rows
 
@@ -263,14 +305,14 @@ class ProfileStore:
     ) -> list[sqlite3.Row]:
         conflicts = conn.execute(
             "SELECT * FROM memory_candidates WHERE conv_id = ? AND status = 'confirmed' "
-            "AND candidate_id != ? AND profile_key = ?",
-            (row["conv_id"], row["candidate_id"], row["profile_key"]),
+            "AND candidate_id != ? AND profile_key = ? AND category_scope = ?",
+            (row["conv_id"], row["candidate_id"], row["profile_key"], row["category_scope"]),
         ).fetchall()
         for conflict_key in self._conflicting_keys(row["profile_key"]):
             opposite = conn.execute(
                 "SELECT * FROM memory_candidates WHERE conv_id = ? AND status = 'confirmed' "
-                "AND profile_key = ?",
-                (row["conv_id"], conflict_key),
+                "AND profile_key = ? AND category_scope = ?",
+                (row["conv_id"], conflict_key, row["category_scope"]),
             ).fetchall()
             conflicts.extend(
                 item for item in opposite
@@ -284,8 +326,8 @@ class ProfileStore:
                 (conflict["candidate_id"],),
             )
             conn.execute(
-                "DELETE FROM user_profiles WHERE conv_id = ? AND profile_key = ?",
-                (row["conv_id"], conflict["profile_key"]),
+                "DELETE FROM user_profiles WHERE conv_id = ? AND candidate_id = ?",
+                (row["conv_id"], conflict["candidate_id"]),
             )
 
         conn.execute(
@@ -296,9 +338,9 @@ class ProfileStore:
         conn.execute("""
             INSERT INTO user_profiles (
                 conv_id, profile_key, profile_value, confidence, last_updated,
-                source, candidate_id
-            ) VALUES (?, ?, ?, ?, ?, 'explicit', ?)
-            ON CONFLICT(conv_id, profile_key) DO UPDATE SET
+                source, candidate_id, category_scope
+            ) VALUES (?, ?, ?, ?, ?, 'explicit', ?, ?)
+            ON CONFLICT(conv_id, category_scope, profile_key) DO UPDATE SET
                 profile_value = excluded.profile_value,
                 confidence = excluded.confidence,
                 last_updated = excluded.last_updated,
@@ -311,8 +353,39 @@ class ProfileStore:
             row["confidence"],
             row["created_at"],
             row["candidate_id"],
+            row["category_scope"],
         ))
+        if row["profile_key"] == "product_category":
+            self._bind_unscoped(conn, row["conv_id"], row["profile_value"])
         return list(unique_conflicts.values())
+
+    @staticmethod
+    def _active_category(conn: sqlite3.Connection, conv_id: str) -> str:
+        row = conn.execute("SELECT profile_value FROM user_profiles WHERE conv_id = ? "
+                           "AND profile_key = 'product_category' AND category_scope = ''", (conv_id,)).fetchone()
+        return row[0] if row else ""
+
+    @staticmethod
+    def _bind_unscoped(conn: sqlite3.Connection, conv_id: str, category: str) -> None:
+        """Bind requirements given before the user has chosen a category."""
+        rows = conn.execute("SELECT * FROM memory_candidates WHERE conv_id = ? AND category_scope = '' "
+                            "AND profile_key != 'product_category' AND status = 'confirmed'", (conv_id,)).fetchall()
+        for row in rows:
+            conn.execute("UPDATE memory_candidates SET status = 'expired' WHERE conv_id = ? AND category_scope = ? "
+                         "AND profile_key = ? AND status = 'confirmed'", (conv_id, category, row["profile_key"]))
+            conn.execute("DELETE FROM user_profiles WHERE conv_id = ? AND category_scope = ? AND profile_key = ?",
+                         (conv_id, category, row["profile_key"]))
+        conn.execute("UPDATE user_profiles SET category_scope = ? WHERE conv_id = ? AND category_scope = '' "
+                     "AND profile_key != 'product_category'", (category, conv_id))
+        conn.execute("UPDATE memory_candidates SET category_scope = ? WHERE conv_id = ? AND category_scope = '' "
+                     "AND profile_key != 'product_category' AND status IN ('pending', 'confirmed')", (category, conv_id))
+
+    def for_category(self, conv_id: str, category: str):
+        """Return a turn-local view; never mutate a shared store's active context."""
+        return _CategoryProfileView(self, conv_id, category)
+
+    def serialize_effective(self, conv_id: str, profile: dict) -> str:
+        return self.serialize_profile(conv_id, effective_profile=profile)
 
     def add_candidate(
         self,
@@ -325,6 +398,7 @@ class ProfileStore:
         source_message_id: str,
         evidence_span: str,
         expires_at: str | None = None,
+        category_scope: str | None = None,
     ) -> MemoryCandidate:
         """Create a candidate; explicit values become active immediately."""
         value = value.strip()
@@ -348,11 +422,14 @@ class ProfileStore:
         conn = self._connect()
         conn.execute("BEGIN IMMEDIATE")
         self._expire_due(conn, conv_id)
+        scope = "" if key == "product_category" else (
+            self._active_category(conn, conv_id) if category_scope is None else category_scope
+        )
         existing = conn.execute(
             "SELECT * FROM memory_candidates WHERE conv_id = ? AND profile_key = ? "
             "AND profile_value = ? AND status IN ('pending', 'confirmed') "
-            "ORDER BY created_at DESC LIMIT 1",
-            (conv_id, key, value),
+            "AND category_scope = ? ORDER BY created_at DESC LIMIT 1",
+            (conv_id, key, value, scope),
         ).fetchone()
         if existing:
             if memory_type == "explicit":
@@ -396,8 +473,8 @@ class ProfileStore:
             INSERT INTO memory_candidates (
                 candidate_id, conv_id, profile_key, profile_value, memory_type,
                 confidence, source_message_id, evidence_span, created_at,
-                expires_at, status, schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                expires_at, status, schema_version, category_scope
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
         """, (
             candidate_id,
             conv_id,
@@ -410,6 +487,7 @@ class ProfileStore:
             _to_iso(created),
             expires_at,
             MEMORY_SCHEMA_VERSION,
+            scope,
         ))
         row = self._candidate_by_id(conn, conv_id, candidate_id)
         conflicts: list[sqlite3.Row] = []
@@ -523,19 +601,20 @@ class ProfileStore:
         )
         return self._row_to_candidate(result)
 
-    def delete_profile_key(self, conv_id: str, key: str) -> int:
+    def delete_profile_key(self, conv_id: str, key: str, *, category_scope: str | None = None) -> int:
         if key not in PROFILE_KEYS:
             raise ValueError("unsupported profile key")
         conn = self._connect()
         conn.execute("BEGIN IMMEDIATE")
+        scope = "" if key == "product_category" else (self._active_category(conn, conv_id) if category_scope is None else category_scope)
         cursor = conn.execute(
             "UPDATE memory_candidates SET status = 'deleted' "
-            "WHERE conv_id = ? AND profile_key = ? AND status IN ('pending', 'confirmed')",
-            (conv_id, key),
+            "WHERE conv_id = ? AND profile_key = ? AND category_scope = ? AND status IN ('pending', 'confirmed')",
+            (conv_id, key, scope),
         )
         conn.execute(
-            "DELETE FROM user_profiles WHERE conv_id = ? AND profile_key = ?",
-            (conv_id, key),
+            "DELETE FROM user_profiles WHERE conv_id = ? AND profile_key = ? AND category_scope = ?",
+            (conv_id, key, scope),
         )
         count = cursor.rowcount
         conn.commit()
@@ -567,8 +646,8 @@ class ProfileStore:
         )
         if row["status"] == "confirmed":
             conn.execute(
-                "DELETE FROM user_profiles WHERE conv_id = ? AND profile_key = ?",
-                (conv_id, row["profile_key"]),
+                "DELETE FROM user_profiles WHERE conv_id = ? AND candidate_id = ?",
+                (conv_id, candidate_id),
             )
         conn.commit()
         result = self._candidate_by_id(conn, conv_id, candidate_id)
@@ -617,11 +696,14 @@ class ProfileStore:
             )
         return [self._row_to_candidate(row) for row in rows]
 
-    def get_structured(self, conv_id: str) -> dict:
+    def get_structured(self, conv_id: str, *, category_scope: str | None = None) -> dict:
         """Return only confirmed, unexpired values eligible for hard filters."""
         candidates = self.list_candidates(conv_id, statuses=("confirmed",))
+        category = next((c.value for c in candidates if c.key == "product_category"), "") if category_scope is None else category_scope
         profile = {}
         for candidate in candidates:
+            if candidate.key != "product_category" and candidate.category_scope != category:
+                continue
             if candidate.key in profile:
                 continue
             effective = candidate.confidence * math.exp(
@@ -636,6 +718,8 @@ class ProfileStore:
                     "status": candidate.status,
                     "expires_at": candidate.expires_at,
                 }
+        if category_scope is not None:
+            profile["product_category"] = {"value": category_scope, "confidence": 1.0, "source": "session"}
         return profile
 
     def clear_conv(self, conv_id: str) -> None:
@@ -687,13 +771,15 @@ class ProfileStore:
             memories.append(f"[dist={distance:.3f}] {document}")
         return memories
 
-    def serialize_profile(self, conv_id: str) -> str:
+    def serialize_profile(self, conv_id: str, *, category_scope: str | None = None, effective_profile: dict | None = None) -> str:
         """Show confirmed constraints and pending candidates separately."""
-        profile = self.get_structured(conv_id)
+        profile = self.get_structured(conv_id, category_scope=category_scope) if effective_profile is None else effective_profile
         pending = self.list_candidates(conv_id, statuses=("pending",))
+        category = profile.get("product_category", {}).get("value", "")
+        pending = [c for c in pending if c.key == "product_category" or c.category_scope == category]
         lines = []
         if profile:
-            lines.append("## 已确认画像")
+            lines.append("## 本轮有效需求" if effective_profile is not None else "## 已确认画像")
             for key, info in profile.items():
                 conf_pct = int(info["confidence"] * 100)
                 lines.append(f"- {key}: {info['value']} (置信度 {conf_pct}%)")
@@ -715,3 +801,46 @@ class ProfileStore:
         return "## 用户历史偏好记忆（仅供参考）\n" + "\n".join(
             f"- {memory}" for memory in memories
         )
+
+
+class _CategoryProfileView:
+    """A per-turn category binding, safe across concurrent conversations."""
+
+    def __init__(self, store: ProfileStore, conv_id: str, category: str):
+        self.store, self.conv_id, self.category = store, conv_id, category
+
+    def _check(self, conv_id: str) -> None:
+        if conv_id != self.conv_id:
+            raise ValueError("category view belongs to another conversation")
+
+    def get_structured(self, conv_id: str) -> dict:
+        self._check(conv_id)
+        return self.store.get_structured(conv_id, category_scope=self.category)
+
+    def serialize_profile(self, conv_id: str) -> str:
+        self._check(conv_id)
+        return self.store.serialize_profile(conv_id, category_scope=self.category)
+
+    def serialize_effective(self, conv_id: str, profile: dict) -> str:
+        self._check(conv_id)
+        return self.store.serialize_profile(conv_id, category_scope=self.category, effective_profile=profile)
+
+    def add_candidate(self, conv_id: str, key: str, value: str, **kwargs):
+        self._check(conv_id)
+        return self.store.add_candidate(conv_id, key, value, category_scope=self.category, **kwargs)
+
+    def delete_profile_key(self, conv_id: str, key: str) -> int:
+        self._check(conv_id)
+        return self.store.delete_profile_key(conv_id, key, category_scope=self.category)
+
+    def confirm_candidate(self, conv_id: str, candidate_id: str):
+        self._check(conv_id)
+        return self.store.confirm_candidate(conv_id, candidate_id)
+
+    def reject_candidate(self, conv_id: str, candidate_id: str):
+        self._check(conv_id)
+        return self.store.reject_candidate(conv_id, candidate_id)
+
+    def delete_candidate(self, conv_id: str, candidate_id: str):
+        self._check(conv_id)
+        return self.store.delete_candidate(conv_id, candidate_id)

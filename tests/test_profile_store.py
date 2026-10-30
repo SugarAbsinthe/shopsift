@@ -50,7 +50,7 @@ def test_inferred_memory_remains_pending_and_outside_hard_constraints(tmp_path):
     assert candidate.source_message_id == "msg-source"
     assert candidate.evidence_span == "source evidence"
     assert candidate.expires_at > candidate.created_at
-    assert candidate.schema_version == "1.0"
+    assert candidate.schema_version == "1.1"
     assert store.get_structured("conv-1") == {}
 
 
