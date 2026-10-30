@@ -101,6 +101,7 @@ def test_graph_keeps_verified_explicit_product_fact():
     ("Product ID: 99, price: 7999 RMB", True),
     ("Product ID: 1, price: 8999 RMB", True),
     ("Product ID: 1, price: 7999 RMB", False),
+    ("预算 8000 元。产品 ID: 1，约 7999 元。", False),
 ])
 def test_stream_only_emits_verified_answer_and_done_matches_state(tmp_path, checkpoint, answer, failed):
     from tests.test_graph import StreamingFakeLLM, FakeProfileStore
